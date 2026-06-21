@@ -1,85 +1,46 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import mlflow.xgboost
+import pandas as pd
 import os
-import threading
-import time
 
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+app = FastAPI(title="Sales Forecasting API")
 
+# Define the expected input payload based on Rossmann features
+class StoreData(BaseModel):
+    Store: int
+    DayOfWeek: int
+    Promo: int
+    StateHoliday: int
+    SchoolHoliday: int
+    Year: int
+    Month: int
+    Day: int
 
-app = FastAPI()
+# Load the model at startup (Ensure you replace RUN_ID with your actual MLflow run ID later)
+MODEL_URI = os.getenv("MODEL_URI", "runs:/<YOUR_RUN_ID>/xgboost_model")
+try:
+    model = mlflow.xgboost.load_model(MODEL_URI)
+except Exception as e:
+    model = None
+    print(f"Warning: Model could not be loaded. Ensure MODEL_URI is correct. Error: {e}")
 
+@app.get("/")
+def health_check():
+    return {"status": "API is running", "model_loaded": model is not None}
 
-# ✅ paths
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(BASE_DIR)
-
-DATA_FOLDER = os.path.join(PROJECT_ROOT, "data", "raw")
-COUNTER_FILE = os.path.join(BASE_DIR, "counter.txt")
-
-
-# ✅ initialize counter
-def initialize_counter():
-    if not os.path.exists(COUNTER_FILE):
-        with open(COUNTER_FILE, "w") as f:
-            f.write("0")
-
-
-# ✅ increment counter
-def increment_counter():
-    with open(COUNTER_FILE, "r") as f:
-        value = int(f.read())
-
-    value += 1
-
-    with open(COUNTER_FILE, "w") as f:
-        f.write(str(value))
-
-    print(f"✅ Counter updated: {value}")
-
-
-# ✅ watchdog handler
-class DataHandler(FileSystemEventHandler):
-
-    def on_created(self, event):
-        if not event.is_directory:
-            print(f"📁 New file detected: {event.src_path}")
-            increment_counter()
-
-
-# ✅ watcher loop
-def start_watching():
-
-    initialize_counter()
-
-    os.makedirs(DATA_FOLDER, exist_ok=True)
-
-    observer = Observer()
-    observer.schedule(DataHandler(), DATA_FOLDER, recursive=False)
-
-    observer.start()
-
-    print("👀 Watching for new files in data/raw...")
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
-
-    observer.join()
-
-
-# ✅ run watcher when FastAPI starts
-@app.on_event("startup")
-def startup():
-
-    thread = threading.Thread(target=start_watching, daemon=True)
-    thread.start()
-
-
-# ✅ endpoint to check counter
-@app.get("/counter")
-def get_counter():
-    with open(COUNTER_FILE, "r") as f:
-        return {"counter": f.read()}
+@app.post("/predict")
+def predict_sales(data: StoreData):
+    if model is None:
+        raise HTTPException(status_code=500, detail="Model is not loaded.")
+    
+    # Convert payload to DataFrame
+    input_df = pd.DataFrame([data.model_dump()])
+    
+    # Predict
+    prediction = model.predict(input_df)
+    
+    return {
+        "store_id": data.Store,
+        "predicted_sales": float(prediction[0])
+    }

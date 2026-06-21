@@ -1,0 +1,11 @@
+stages:
+  train:
+    cmd: python pipelines/training_pipeline.py
+    deps:
+      - data/raw/train.csv
+      - src/data.py
+      - src/features.py
+      - src/model.py
+      - src/train.py
+    outs:
+      - mlruns/

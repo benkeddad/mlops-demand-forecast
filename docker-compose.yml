@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  fastapi_app:
+    build: 
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_URI=runs:/<REPLACE_WITH_RUN_ID>/xgboost_model
+    depends_on:
+      - mlflow_server
+
+  mlflow_server:
+    image: python:3.9-slim
+    ports:
+      - "5000:5000"
+    command: >
+      bash -c "pip install mlflow && 
+               mlflow server --host 0.0.0.0 --port 5000"
