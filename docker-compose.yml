@@ -8,7 +8,10 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - MODEL_URI=runs:/<REPLACE_WITH_RUN_ID>/xgboost_model
+      - MODEL_URI=runs:/8fa7b21c43e5469fa021b6d3986a11ef/xgboost_model
+      - MLFLOW_TRACKING_URI=http://mlflow_server:5000
+    volumes:
+      - ./mlruns:/code/mlruns  # <-- Gives FastAPI access to the artifact files
     depends_on:
       - mlflow_server
 
@@ -16,6 +19,8 @@ services:
     image: python:3.9-slim
     ports:
       - "5000:5000"
+    volumes:
+      - ./mlruns:/code/mlruns  # <-- Maps your local training history into the server
     command: >
       bash -c "pip install mlflow && 
-               mlflow server --host 0.0.0.0 --port 5000"
+               mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri /code/mlruns --default-artifact-root /code/mlruns"
