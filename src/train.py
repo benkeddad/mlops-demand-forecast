@@ -38,4 +38,4 @@ def run_training(data_path: str):
 
 if __name__ == "__main__":
     # Point this to your actual raw file name
-    run_training("data/raw/New Microsoft Excel Worksheet.xlsx")
+    run_training("data/raw/train.csv")

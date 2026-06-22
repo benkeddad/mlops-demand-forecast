@@ -1,17 +1,110 @@
+import io
+import os
+import logging
+import asyncio
+from contextlib import asynccontextmanager
+
+import mlflow.xgboost
+import pandas as pd
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import mlflow.xgboost
-import pandas as pd
-import io
-import os
 
-app = FastAPI(title="Sales Forecasting API")
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
+logger = logging.getLogger("sales_api")
 
-# ADD THIS LINE HERE: Tell MLflow to use the tracking network address
-mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://mlflow_server:5000"))
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+MODEL_URI  = os.getenv("MODEL_URI", "")
 
-# Define the expected input payload for single predictions
+mlflow.set_tracking_uri(MLFLOW_URI)
+logger.info("MLflow tracking URI → %s", MLFLOW_URI)
+logger.info("Model URI           → %s", MODEL_URI or "<not set>")
+
+# ---------------------------------------------------------------------------
+# Model state
+# ---------------------------------------------------------------------------
+_model            = None
+_model_load_error = None
+
+FEATURE_COLUMNS = [
+    "Store", "DayOfWeek", "Promo",
+    "StateHoliday", "SchoolHoliday",
+    "Year", "Month", "Day",
+]
+
+
+def _load_model() -> bool:
+    """Single attempt to load the model. Returns True on success."""
+    global _model, _model_load_error
+
+    if not MODEL_URI:
+        _model_load_error = "MODEL_URI environment variable is not set."
+        logger.error(_model_load_error)
+        return False
+
+    if "<YOUR_RUN_ID>" in MODEL_URI:
+        _model_load_error = "MODEL_URI still contains the placeholder '<YOUR_RUN_ID>'."
+        logger.error(_model_load_error)
+        return False
+
+    try:
+        logger.info("Loading model → %s", MODEL_URI)
+        _model = mlflow.xgboost.load_model(MODEL_URI)
+        _model_load_error = None
+        logger.info("Model loaded successfully.")
+        return True
+
+    except Exception as exc:
+        _model = None
+        _model_load_error = (
+            f"{exc}  |  MLflow URI: {MLFLOW_URI}  |  Model URI: {MODEL_URI}"
+        )
+        logger.warning("Model load failed: %s", exc)
+        return False
+
+
+async def _load_model_with_retry():
+    """
+    Background task: retries loading the model every 15 s for up to 10 minutes.
+    This handles the race where FastAPI starts before the MLflow server is ready.
+    """
+    for attempt in range(40):           # 40 × 15 s = 10 minutes max
+        if _load_model():
+            return
+        logger.info(
+            "MLflow not ready yet (attempt %d/40). Retrying in 15 s...", attempt + 1
+        )
+        await asyncio.sleep(15)
+    logger.error("Gave up loading model after 40 attempts.")
+
+
+# ---------------------------------------------------------------------------
+# App lifespan — starts the retry task in the background
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_load_model_with_retry())
+    yield
+    task.cancel()
+
+
+app = FastAPI(
+    title="Sales Forecasting API",
+    description="XGBoost-based Rossmann store sales forecaster backed by MLflow.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+# ---------------------------------------------------------------------------
+# Input schema
+# ---------------------------------------------------------------------------
 class StoreData(BaseModel):
     Store: int
     DayOfWeek: int
@@ -22,89 +115,106 @@ class StoreData(BaseModel):
     Month: int
     Day: int
 
-# Load the model at startup
-MODEL_URI = os.getenv("MODEL_URI", "runs:/<YOUR_RUN_ID>/xgboost_model")
-try:
-    model = mlflow.xgboost.load_model(MODEL_URI)
-except Exception as e:
-    model = None
-    print(f"Warning: Model could not be loaded. Ensure MODEL_URI is correct. Error: {e}")
 
-@app.get("/")
+def _require_model():
+    if _model is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Model is not loaded yet.",
+                "reason": _model_load_error,
+                "fix": "The server retries automatically every 15 s. "
+                       "Check logs for progress, or POST /reload-model to force a retry.",
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@app.get("/", summary="Health check")
 def health_check():
-    return {"status": "API is running", "model_loaded": model is not None}
-
-@app.post("/predict")
-def predict_sales(data: StoreData):
-    if model is None:
-        raise HTTPException(status_code=500, detail="Model is not loaded.")
-    
-    # Convert payload to DataFrame
-    input_df = pd.DataFrame([data.model_dump()])
-    
-    # Predict
-    prediction = model.predict(input_df)
-    
     return {
-        "store_id": data.Store,
-        "predicted_sales": float(prediction[0])
+        "status": "API is running",
+        "model_loaded": _model is not None,
+        "mlflow_uri": MLFLOW_URI,
+        "model_uri": MODEL_URI or "not set",
+        "error": _model_load_error,
     }
 
-@app.post("/predict-batch")
+
+@app.post("/reload-model", summary="Force a model reload now")
+def reload_model():
+    success = _load_model()
+    if success:
+        return {"status": "Model reloaded successfully.", "model_uri": MODEL_URI}
+    raise HTTPException(
+        status_code=503,
+        detail={"error": "Reload failed.", "reason": _model_load_error},
+    )
+
+
+@app.post("/predict", summary="Predict sales for a single store/day")
+def predict_sales(data: StoreData):
+    _require_model()
+    prediction = _model.predict(pd.DataFrame([data.model_dump()]))
+    return {
+        "store_id": data.Store,
+        "predicted_sales": round(float(prediction[0]), 2),
+    }
+
+
+@app.post("/predict-batch", summary="Predict sales for a CSV of store/day rows")
 async def predict_batch(file: UploadFile = File(...)):
-    if model is None:
-        raise HTTPException(status_code=500, detail="Model is not loaded.")
-    
-    # 1. Read the uploaded CSV bytes into a DataFrame
+    _require_model()
+
     try:
         contents = await file.read()
         df = pd.read_csv(io.BytesIO(contents))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid CSV file. Error: {e}")
-    
-    # 2. Smart Feature Engineering: If the CSV has a raw 'Date' column, split it automatically
-    if "Date" in df.columns and not all(col in df.columns for col in ["Year", "Month", "Day"]):
-        try:
-            datetime_col = pd.to_datetime(df["Date"])
-            df["Year"] = datetime_col.dt.year
-            df["Month"] = datetime_col.dt.month
-            df["Day"] = datetime_col.dt.day
-        except Exception:
-            raise HTTPException(status_code=400, detail="Failed to parse 'Date' column. Ensure format is YYYY-MM-DD.")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid CSV: {exc}")
 
-    # 3. Handle StateHoliday conversion to clean integers matching your StoreData expectations
+    # Auto-expand Date column
+    if "Date" in df.columns:
+        missing = [c for c in ("Year", "Month", "Day", "DayOfWeek") if c not in df.columns]
+        if missing:
+            try:
+                dt = pd.to_datetime(df["Date"])
+                if "Year"      in missing: df["Year"]      = dt.dt.year
+                if "Month"     in missing: df["Month"]     = dt.dt.month
+                if "Day"       in missing: df["Day"]       = dt.dt.day
+                if "DayOfWeek" in missing: df["DayOfWeek"] = dt.dt.dayofweek
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Failed to parse 'Date' column — expected YYYY-MM-DD.",
+                )
+
+    # Normalise StateHoliday
     if "StateHoliday" in df.columns:
-        df["StateHoliday"] = df["StateHoliday"].astype(str).str.strip()
-        df["StateHoliday"] = df["StateHoliday"].map({"0": 0, "a": 1, "b": 2, "c": 3}).fillna(0).astype(int)
+        df["StateHoliday"] = (
+            df["StateHoliday"].astype(str).str.strip()
+            .map({"0": 0, "a": 1, "b": 2, "c": 3})
+            .fillna(0).astype(int)
+        )
 
-    # 4. Enforce the exact 8 features and their ordering required by your XGBoost model
-    feature_columns = ["Store", "DayOfWeek", "Promo", "StateHoliday", "SchoolHoliday", "Year", "Month", "Day"]
-    
-    missing_cols = [col for col in feature_columns if col not in df.columns]
+    missing_cols = [c for c in FEATURE_COLUMNS if c not in df.columns]
     if missing_cols:
         raise HTTPException(
-            status_code=400, 
-            detail=f"Uploaded CSV is missing required columns. Must contain either a 'Date' column or individual features: {missing_cols}"
+            status_code=400,
+            detail=f"CSV is missing columns: {missing_cols}. "
+                   "Include a 'Date' column or Year/Month/Day/DayOfWeek individually.",
         )
-    
-    # Extract only the features the model knows how to read
-    input_df = df[feature_columns]
-    
-    # 5. Generate batch predictions
+
     try:
-        predictions = model.predict(input_df)
-        df["predicted_sales"] = predictions.tolist()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Model prediction failed: {e}")
-    
-    # 6. Stream the updated DataFrame back to the user as a file download
+        df["predicted_sales"] = _model.predict(df[FEATURE_COLUMNS]).round(2).tolist()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}")
+
     stream = io.StringIO()
     df.to_csv(stream, index=False)
-    
-    response = StreamingResponse(
-        iter([stream.getvalue()]),
-        media_type="text/csv"
+    response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
+    response.headers["Content-Disposition"] = (
+        "attachment; filename=rossmann_batch_predictions.csv"
     )
-    response.headers["Content-Disposition"] = "attachment; filename=rossmann_batch_predictions.csv"
-    
     return response
