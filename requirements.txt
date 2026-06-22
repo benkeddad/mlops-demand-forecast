@@ -16,5 +16,11 @@ openpyxl>=3.1.0
 # API Deployment
 fastapi>=0.100.0
 uvicorn>=0.22.0
-pydantic
-python-multipart
+pydantic>=2.0.0
+python-multipart>=0.0.6
+
+# Monitoring
+evidently>=0.4.0
+
+# File Watcher (used by run.py)
+watchdog>=3.0.0
