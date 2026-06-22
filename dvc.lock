@@ -1,0 +1,31 @@
+schema: '2.0'
+stages:
+  train:
+    cmd: python pipelines/training_pipeline.py
+    deps:
+    - path: data/raw/train.csv
+      hash: md5
+      md5: d47aedd9e2d580e06a6ef7ce1732e8b6
+      size: 38057952
+    - path: src/data.py
+      hash: md5
+      md5: 04e90bd740250bf5971cc5760b073fa4
+      size: 785
+    - path: src/features.py
+      hash: md5
+      md5: a81ab1e7a946d9cc7f5b4b02551d81da
+      size: 898
+    - path: src/model.py
+      hash: md5
+      md5: bf117b1228e9c190e8e2df3856b3b431
+      size: 371
+    - path: src/train.py
+      hash: md5
+      md5: b942995b310e5963d1dd5f88a7674a3a
+      size: 1402
+    outs:
+    - path: mlruns/
+      hash: md5
+      md5: b1c2a567dd089c8b22c4d418212a784f.dir
+      size: 2429464
+      nfiles: 27
