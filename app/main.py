@@ -1,5 +1,6 @@
 import io
 import os
+import sys
 import logging
 import asyncio
 import subprocess
@@ -57,25 +58,38 @@ app = FastAPI(title="Sales Forecasting API", lifespan=lifespan)
 # Routes
 # ---------------------------------------------------------------------------
 
+import sys # <--- Make sure you have this import at the top of main.py
+
 @app.post("/upload", summary="Upload new data and trigger DVC/Prefect training")
 async def upload_new_data(file: UploadFile = File(...)):
     """Saves raw data and triggers the background training orchestration."""
     target_path = os.path.join("data", "raw", "train.csv")
     
-    # 1. Save data
+    # 1. Save the uploaded file
     try:
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
         with open(target_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+        logger.info("File saved to %s", target_path)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"File save error: {exc}")
 
-    # 2. Trigger Prefect Orchestrator (Non-blocking)
+    # 2. Trigger Prefect Orchestrator 
+    # sys.executable ensures we use the Python inside your active venv
+    pipeline_script = os.path.join("pipelines", "training_pipeline.py")
+    
     try:
-        # Popen runs this in a separate process, keeping the API responsive
-        subprocess.Popen(["python", "pipelines/training_pipeline.py"])
-        return {"status": "Training pipeline triggered in background."}
+        logger.info("Triggering background training using: %s", sys.executable)
+        
+        # We use sys.executable to ensure the sub-process has access to 'prefect'
+        subprocess.Popen([sys.executable, pipeline_script])
+        
+        return {
+            "status": "Training pipeline triggered in background.",
+            "pipeline_path": pipeline_script
+        }
     except Exception as exc:
+        logger.error("Orchestration failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Orchestration failed: {exc}")
 
 @app.post("/predict-batch", summary="Predict sales from CSV")

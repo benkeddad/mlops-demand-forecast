@@ -1,6 +1,7 @@
 stages:
   ingest:
-    cmd: python src/data.py
+    # Adding PYTHONPATH=. tells Python to look in the current folder for the 'src' package
+    cmd: set PYTHONPATH=. && python src/data.py
     deps:
       - data/raw/train.csv
       - src/data.py
@@ -8,7 +9,7 @@ stages:
       - data/processed/clean_data.csv
 
   featurize:
-    cmd: python src/features.py
+    cmd: set PYTHONPATH=. && python src/features.py
     deps:
       - data/processed/clean_data.csv
       - src/features.py
@@ -16,7 +17,7 @@ stages:
       - data/processed/train_features.csv
 
   train:
-    cmd: python src/train.py
+    cmd: set PYTHONPATH=. && python src/train.py
     deps:
       - data/processed/train_features.csv
       - src/train.py
