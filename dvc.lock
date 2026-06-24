@@ -29,3 +29,35 @@ stages:
       md5: 971d50242a5e49bb552f11dcc484d5e1.dir
       size: 2204062
       nfiles: 27
+  ingest:
+    cmd: python src/data.py
+    deps:
+    - path: data/raw/train.csv
+      hash: md5
+      md5: 01deba9a7b2830e0bdb3b0df92df1599
+      size: 35006344
+    - path: src/data.py
+      hash: md5
+      md5: 7c6a7497fbb5fd1531c94ee21cba0ee6
+      size: 1072
+    outs:
+    - path: data/processed/clean_data.csv
+      hash: md5
+      md5: 01deba9a7b2830e0bdb3b0df92df1599
+      size: 35006344
+  featurize:
+    cmd: python src/features.py
+    deps:
+    - path: data/processed/clean_data.csv
+      hash: md5
+      md5: 01deba9a7b2830e0bdb3b0df92df1599
+      size: 35006344
+    - path: src/features.py
+      hash: md5
+      md5: c14959ef04270db5bd3925b91ef876ba
+      size: 2078
+    outs:
+    - path: data/processed/train_features.csv
+      hash: md5
+      md5: 6966f2fb9ac21dc521f5d6ef625643df
+      size: 27970820
