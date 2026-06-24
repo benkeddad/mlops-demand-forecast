@@ -1,36 +1,24 @@
 schema: '2.0'
 stages:
   train:
-    cmd: python pipelines/training_pipeline.py
+    cmd: set PYTHONPATH=. && python src/train.py
     deps:
-    - path: data/raw/train.csv
+    - path: data/processed/train_features.csv
       hash: md5
-      md5: d47aedd9e2d580e06a6ef7ce1732e8b6
-      size: 38057952
-    - path: src/data.py
-      hash: md5
-      md5: 04e90bd740250bf5971cc5760b073fa4
-      size: 785
-    - path: src/features.py
-      hash: md5
-      md5: f636a2a7583a552723737a6e42a57a08
-      size: 1732
-    - path: src/model.py
-      hash: md5
-      md5: bf117b1228e9c190e8e2df3856b3b431
-      size: 371
+      md5: 6966f2fb9ac21dc521f5d6ef625643df
+      size: 27970820
     - path: src/train.py
       hash: md5
-      md5: 64348a103459500387905040d58d646d
-      size: 1377
+      md5: 0b531cd03b9238d4ea7b2d42155d1078
+      size: 1533
     outs:
     - path: mlruns/
       hash: md5
-      md5: 971d50242a5e49bb552f11dcc484d5e1.dir
-      size: 2204062
-      nfiles: 27
+      md5: 7f6dfa1aa557a7f4235479e98861889f.dir
+      size: 1609
+      nfiles: 22
   ingest:
-    cmd: python src/data.py
+    cmd: set PYTHONPATH=. && python src/data.py
     deps:
     - path: data/raw/train.csv
       hash: md5
@@ -46,7 +34,7 @@ stages:
       md5: 01deba9a7b2830e0bdb3b0df92df1599
       size: 35006344
   featurize:
-    cmd: python src/features.py
+    cmd: set PYTHONPATH=. && python src/features.py
     deps:
     - path: data/processed/clean_data.csv
       hash: md5

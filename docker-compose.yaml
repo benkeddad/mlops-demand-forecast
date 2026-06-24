@@ -1,30 +1,42 @@
 version: '3.8'
 
 services:
-  mlflow_server:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-    container_name: mlflow_server
+  # 1. The MLflow Tracking Server
+  mlflow:
+    image: python:3.9-slim
+    container_name: rossmann-mlflow
+    working_dir: /app
+    volumes:
+      - ./mlruns:/app/mlruns
+    command: pip install mlflow && mlflow server --host 0.0.0.0 --port 5000
     ports:
       - "5000:5000"
-    volumes:
-      - ./mlruns:/code/mlruns
-    # Runs instantly using the pre-installed mlflow package from your requirements
-    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri /code/mlruns --default-artifact-root /code/mlruns
 
-  fastapi_app:
+  # 2. The Prefect Server
+  prefect:
+    image: python:3.9-slim
+    container_name: rossmann-prefect
+    working_dir: /app
+    environment:
+      - PREFECT_SERVER_API_HOST=0.0.0.0
+    command: pip install prefect && prefect server start --host 0.0.0.0
+    ports:
+      - "4200:4200"
+
+# 3. Your FastAPI App (The Control Center)
+  api:
     build:
       context: .
-      dockerfile: docker/Dockerfile
-    container_name: fastapi_app
+      dockerfile: docker/Dockerfile  # <--- Point it to your subfolder
+    container_name: rossmann-api
+    depends_on:
+      - mlflow
+      - prefect
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - PREFECT_API_URL=http://prefect:4200/api
+    volumes:
+      - ./data:/app/data
+      - ./mlruns:/app/mlruns
     ports:
       - "8000:8000"
-    environment:
-      MODEL_URI: ${MODEL_URI}
-      MLFLOW_TRACKING_URI: http://mlflow_server:5000
-    env_file:
-      - .env
-    volumes:
-      - ./mlruns:/code/mlruns
-    restart: on-failure
