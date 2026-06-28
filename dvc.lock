@@ -5,25 +5,25 @@ stages:
     deps:
     - path: data/processed/train_features.csv
       hash: md5
-      md5: 6966f2fb9ac21dc521f5d6ef625643df
-      size: 27970820
+      md5: e06300b201b3c7376178e4fda6353b65
+      size: 44246116
     - path: src/train.py
       hash: md5
-      md5: 0b531cd03b9238d4ea7b2d42155d1078
-      size: 1533
+      md5: 8f62a8566b7ea66f7bbeb1a934873185
+      size: 1977
     outs:
     - path: mlruns/
       hash: md5
-      md5: 7f6dfa1aa557a7f4235479e98861889f.dir
-      size: 1609
-      nfiles: 22
+      md5: ab91f8a465f46648a91640c7d70d3362.dir
+      size: 2202729
+      nfiles: 5
   ingest:
     cmd: set PYTHONPATH=. && python src/data.py
     deps:
     - path: data/raw/train.csv
       hash: md5
-      md5: 01deba9a7b2830e0bdb3b0df92df1599
-      size: 35006344
+      md5: 9f4326ac713b94dff311604452c1a614
+      size: 35006240
     - path: src/data.py
       hash: md5
       md5: 7c6a7497fbb5fd1531c94ee21cba0ee6
@@ -31,15 +31,15 @@ stages:
     outs:
     - path: data/processed/clean_data.csv
       hash: md5
-      md5: 01deba9a7b2830e0bdb3b0df92df1599
-      size: 35006344
+      md5: 8b7e64b7ca4bb97cfec251b7b67268d0
+      size: 49247124
   featurize:
     cmd: set PYTHONPATH=. && python src/features.py
     deps:
     - path: data/processed/clean_data.csv
       hash: md5
-      md5: 01deba9a7b2830e0bdb3b0df92df1599
-      size: 35006344
+      md5: 8b7e64b7ca4bb97cfec251b7b67268d0
+      size: 49247124
     - path: src/features.py
       hash: md5
       md5: c14959ef04270db5bd3925b91ef876ba
@@ -47,5 +47,5 @@ stages:
     outs:
     - path: data/processed/train_features.csv
       hash: md5
-      md5: 6966f2fb9ac21dc521f5d6ef625643df
-      size: 27970820
+      md5: e06300b201b3c7376178e4fda6353b65
+      size: 44246116
