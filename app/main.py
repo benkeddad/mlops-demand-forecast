@@ -73,6 +73,14 @@ TRAIN_DIR = os.getenv("TRAIN_DATA_DIR", os.path.join("data", "raw"))
 TARGET_PATH = os.path.join(TRAIN_DIR, "train.csv")
 TRACKING_FILE = os.path.join(TRAIN_DIR, ".train_tracker")
 
+# --- Define the helper ---
+async def wait_and_reload(process, logger_instance):
+    """Waits for the training process to complete and reloads the model."""
+    # Run the blocking wait in a separate thread to avoid blocking the event loop
+    await asyncio.to_thread(process.wait)
+    logger_instance.info("Training pipeline finished. Reloading model...")
+    _load_model()
+
 async def _startup_logic():
     # Now, all your logic uses TARGET_PATH and TRACKING_FILE instead of hardcoded strings
     model_loaded = _load_model()
@@ -105,7 +113,8 @@ async def _startup_logic():
         # Trigger the background pipeline
         pipeline_script = os.path.join("pipelines", "training_pipeline.py")
         try:
-            subprocess.Popen([sys.executable, pipeline_script])
+            process = subprocess.Popen([sys.executable, pipeline_script])
+            asyncio.create_task(wait_and_reload(process, logger))
         except Exception as exc:
             logger.error("Orchestration failed on startup: %s", exc)
     else:
