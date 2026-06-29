@@ -30,6 +30,13 @@ if "%TRAIN_DATA_DIR%"=="" (
     exit /b
 )
 
+:: --- ADDED: Initialize and pull DVC data ---
+echo Initializing DVC...
+call dvc init --no-scm
+echo Pulling DVC data...
+call dvc pull
+:: ------------------------------------------
+
 :: 4. Start MLflow in a separate terminal window
 echo Starting MLflow server...
 start "MLflow Server" cmd /k "call venv\Scripts\activate.bat && mlflow server --host 127.0.0.1 --port 5000"

@@ -119,7 +119,7 @@ async def lifespan(app: FastAPI):
     yield
     task.cancel()
 
-app = FastAPI(title="Sales Forecasting API", lifespan=lifpan if False else lifespan)
+app = FastAPI(title="Sales Forecasting API", lifespan=lifespan if False else lifespan)
 
 # ---------------------------------------------------------------------------
 # Routes
