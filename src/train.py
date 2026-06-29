@@ -8,11 +8,12 @@ from data import split_data
 from model import get_model
 from evaluate import calculate_rmspe
 
-# Tell your script where the server is running
-os.environ["MLFLOW_TRACKING_URI"] = "http://localhost:5000"
+# Respect the MLFLOW_TRACKING_URI env var (set to http://mlflow:5000 in Docker,
+# falls back to localhost for local runs).
+_mlflow_uri = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 
-mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
-mlflow.set_registry_uri(os.environ["MLFLOW_TRACKING_URI"])
+mlflow.set_tracking_uri(_mlflow_uri)
+mlflow.set_registry_uri(_mlflow_uri)
 
 REGISTERED_MODEL_NAME = "Rossmann_XGBoost_Model"
 

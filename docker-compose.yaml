@@ -1,28 +1,54 @@
 services:
-  # Your FastAPI Application
-  api:
-    build: .
-    ports:
-      - "8000:8000"
-    volumes:
-      - .:/app
-    environment:
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
-      - PREFECT_API_URL=http://prefect:4200/api
-    depends_on:
-      - mlflow
-      - prefect
-
-  # MLflow Tracking Server (Fixed Allowed Hosts for internal Docker Network)
+  # MLflow Tracking Server
   mlflow:
     image: ghcr.io/mlflow/mlflow:latest
     ports:
       - "5000:5000"
-    command: mlflow server --host 0.0.0.0 --port 5000 --allowed-hosts "*"
+    volumes:
+      - mlflow_data:/mlflow
+    # Changed backend-store-uri to use an SQLite database file instead of a raw folder
+    command: >
+      mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri sqlite:////mlflow/mlflow.db
+        --default-artifact-root /mlflow/artifacts
+        --allowed-hosts "*"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
 
-  # Prefect Server (Pinned to 2.14)
+  # Prefect Orchestration Server
   prefect:
     image: prefecthq/prefect:2.14-python3.10
     ports:
       - "4200:4200"
     command: prefect server start --host 0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4200/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+
+  # FastAPI Application
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app # Maps your local workspace to /app inside the container
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - PREFECT_API_URL=http://prefect:4200/api
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      prefect:
+        condition: service_healthy
+
+volumes:
+  mlflow_data:
