@@ -1,11 +1,23 @@
 stages:
-  train:
-    cmd: python pipelines/training_pipeline.py
+  ingest:
+    # Adding PYTHONPATH=. tells Python to look in the current folder for the 'src' package
+    cmd: set PYTHONPATH=. && python src/data.py
     deps:
       - data/raw/train.csv
       - src/data.py
-      - src/features.py
-      - src/model.py
-      - src/train.py
     outs:
-      - mlruns/
+      - data/processed/clean_data.csv
+
+  featurize:
+    cmd: set PYTHONPATH=. && python src/features.py
+    deps:
+      - data/processed/clean_data.csv
+      - src/features.py
+    outs:
+      - data/processed/train_features.csv
+
+  train:
+    cmd: set PYTHONPATH=. && python src/train.py
+    deps:
+      - data/processed/train_features.csv
+      - src/train.py
