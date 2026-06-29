@@ -21,5 +21,3 @@ stages:
     deps:
       - data/processed/train_features.csv
       - src/train.py
-    outs:
-      - mlruns/
