@@ -27,11 +27,12 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - .:/app # Maps your local workspace to /app inside the container
+      #- .:/app # Maps your local workspace to /app inside the container
       - mlflow_data:/mlflow # <--- FIX 2: Shared volume so the API can physically read the model artifacts
     environment:
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - PREFECT_API_URL=http://prefect:4200/api
+      - WATCHFILES_FORCE_POLLING=true
     depends_on:
       - mlflow
       - prefect

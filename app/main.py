@@ -6,7 +6,7 @@ import asyncio
 import subprocess
 import shutil
 from contextlib import asynccontextmanager
-
+import hashlib
 import mlflow.xgboost
 import pandas as pd
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -65,6 +65,13 @@ def _load_model() -> bool:
         logger.error("Model load failed: %s", _model_load_error)
         return False
 
+def get_file_hash(filepath, chunk_size=8192):
+    """Calculates the MD5 hash of a file's contents."""
+    hasher = hashlib.md5()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 # Read the directory from the environment, default to "data/raw" if not set
 TRAIN_DIR = os.getenv("TRAIN_DATA_DIR", os.path.join("data", "raw"))
@@ -82,44 +89,71 @@ async def wait_and_reload(process, logger_instance):
     _load_model()
 
 async def _startup_logic():
-    # Now, all your logic uses TARGET_PATH and TRACKING_FILE instead of hardcoded strings
     model_loaded = _load_model()
     
+    # 1. Clean up and mark for forcing immediately if no model could be loaded
+    if not model_loaded:
+        logger.info("No model loaded. Safely clearing inner contents of 'mlruns' to prevent soft-deleted experiment crashes...") 
+        
+        MLRUNS_DIR = os.path.normpath("mlruns")
+        if os.path.exists(MLRUNS_DIR):
+            for item in os.listdir(MLRUNS_DIR):
+                item_path = os.path.join(MLRUNS_DIR, item)
+                try:
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path)
+                    else:
+                        os.remove(item_path)
+                except Exception as e:
+                    logger.warning(f"Could not clear inner item {item_path}: {e}")
+            
+            try:
+                trash_dir = os.path.join(MLRUNS_DIR, ".trash")
+                os.makedirs(trash_dir, exist_ok=True)
+                logger.info(f"Successfully recreated structural folder: {trash_dir}")
+            except Exception as e:
+                logger.error(f"Failed to recreate .trash directory: {e}")
+
     if not os.path.exists(TARGET_PATH):
         if not model_loaded:
             logger.warning(f"No model found and no training data at {TARGET_PATH}.")
         return
 
-    # 3. Data exists. Get its current modification timestamp.
-    current_mtime = str(os.path.getmtime(TARGET_PATH))
-    last_mtime = None
-    
+    # 2. Data exists. Get its current CONTENT HASH instead of mtime.
+    current_hash = get_file_hash(TARGET_PATH)
+    last_hash = None
+
     if os.path.exists(TRACKING_FILE):
         with open(TRACKING_FILE, "r") as f:
-            last_mtime = f.read().strip()
+            last_hash = f.read().strip()
             
-    # 4. Decide whether to trigger training.
-    # We train IF the data changed, OR IF the data exists but we have no model.
-    if current_mtime != last_mtime or not model_loaded:
-        if current_mtime != last_mtime:
-            logger.info("Changes detected in train.csv! Triggering background training.")
+    # 3. Decide whether to trigger training based on CONTENT.
+    data_changed = current_hash != last_hash
+
+    if data_changed or not model_loaded:
+    
+        if data_changed:
+            # Always use DVC when data changed
+            logger.info("Content changes detected in train.csv! Triggering standard DVC pipeline verification.")
+            script_to_run = os.path.normpath(os.path.join("pipelines", "training_pipeline.py"))
+            cmd = [sys.executable, script_to_run]
+    
         else:
-            logger.info("No model found, but training data exists. Triggering initial background training.")
-            
-        # Update the tracking file with the new timestamp
+            # Data unchanged but model missing
+            logger.info("MLflow model missing! Data unchanged, running train.py directly.")
+            script_to_run = os.path.normpath(os.path.join("src", "train.py"))
+            cmd = [sys.executable, script_to_run]
+    
         with open(TRACKING_FILE, "w") as f:
-            f.write(current_mtime)
-            
-        # Trigger the background pipeline
-        pipeline_script = os.path.join("pipelines", "training_pipeline.py")
+            f.write(current_hash)
         try:
-            process = subprocess.Popen([sys.executable, pipeline_script])
+            process = subprocess.Popen(cmd, env=os.environ.copy())
             asyncio.create_task(wait_and_reload(process, logger))
         except Exception as exc:
             logger.error("Orchestration failed on startup: %s", exc)
+    
     else:
-        # 5. Model is loaded and data is unchanged. Do nothing.
-        logger.info("Model loaded successfully and train.csv is unchanged. Ready to serve predictions.")
+        logger.info("Model loaded successfully and train.csv content is identical. Ready to serve predictions.")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

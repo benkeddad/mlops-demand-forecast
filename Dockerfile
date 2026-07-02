@@ -12,13 +12,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy pre-initialized DVC configurations and tracking files
 COPY .dvc/ .dvc/
 COPY dvc.yaml .
+COPY dvc.lock .
 
-# Copy your application modules
+# Copy your application modules and MLflow tracking data
 COPY app/ app/
 COPY pipelines/ pipelines/
 COPY src/ src/
 COPY data/ data/
 COPY monitoring/ monitoring/
+COPY mlruns/ mlruns/
+COPY mlartifacts/ mlartifacts/
 
-# Start FastAPI directly without shell scripts
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Start FastAPI and watch for CSV modifications inside data/raw
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "data/raw", "--reload-include", "*.csv"]

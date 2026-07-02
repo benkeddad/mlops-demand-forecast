@@ -26,8 +26,21 @@ def run_training(processed_data_path: str):
     # 3. Split Data
     X_train, X_val, y_train, y_val = split_data(processed_df, target_col='Sales')
 
+
     # 4. Initialize MLflow
-    mlflow.set_experiment("Rossmann_Sales_Forecasting")
+    experiment_name = "Rossmann_Sales_Forecasting"
+    
+    try:
+        mlflow.set_experiment(experiment_name)
+    
+    except Exception as exc:
+        print(f"Failed to use experiment '{experiment_name}': {exc}")
+    
+        experiment_name = f"Rossmann_Sales_Forecasting_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
+        print(f"Trying fallback experiment: {experiment_name}")
+    
+        mlflow.set_experiment(experiment_name)
+
 
     with mlflow.start_run():
         # 5. Train Model
