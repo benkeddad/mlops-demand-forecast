@@ -22,4 +22,4 @@ COPY data/raw/train.csv data/raw/train.csv
 COPY monitoring/ monitoring/
 
 # Start FastAPI and watch for CSV modifications inside data/raw
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "data/raw", "--reload-include", "*.csv"]
+CMD ["sh", "-c", "mlflow server --host 127.0.0.1 --port 5000 & prefect server start --host 127.0.0.1 --port 4200 & sleep 15 && uvicorn app.main:app --host 0.0.0.0 --port 7860 --reload --reload-dir data/raw --reload-include *.csv"]
