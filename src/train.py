@@ -2,6 +2,9 @@ import pandas as pd
 import mlflow
 import mlflow.xgboost
 import os
+import subprocess
+import sys
+
 
 # 1. Only import what is needed for the ML phase
 from data import split_data
@@ -68,6 +71,15 @@ def run_training(processed_data_path: str):
         print(f"Model registered in MLflow as: {REGISTERED_MODEL_NAME}")
 
 
+
 if __name__ == "__main__":
-    # DVC will make sure this file exists before running.
-    run_training("data/processed/train_features.csv")
+    features_file = "data/processed/train_features.csv"
+
+    if not os.path.exists(features_file):
+        print(f"{features_file} not found.")
+        subprocess.run(
+            [sys.executable, "pipelines/training_pipeline.py"],
+            check=True
+        )
+    else:
+        run_training(features_file)

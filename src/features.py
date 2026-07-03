@@ -1,3 +1,5 @@
+import subprocess
+import sys
 import pandas as pd
 
 # Must match FEATURE_COLUMNS in app/main.py exactly
@@ -50,9 +52,25 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 if __name__ == "__main__":
     print("Running Feature Engineering...")
-    # Load the file that data.py just saved
-    clean_df = pd.read_csv("data/processed/clean_data.csv")
-    
-    processed_df = build_features(clean_df)
-    processed_df.to_csv("data/processed/train_features.csv", index=False)
-    print("Saved train_features.csv")
+
+    try:
+        # Load the file that data.py just saved
+        clean_df = pd.read_csv("data/processed/clean_data.csv")
+
+        processed_df = build_features(clean_df)
+        processed_df.to_csv("data/processed/train_features.csv", index=False)
+
+        print("Saved train_features.csv")
+
+    except Exception as e:
+        print(f"Failed to load clean_data.csv: {e}")
+        print("Launching pipelines/training_pipeline.py...")
+
+        try:
+            subprocess.run(
+                [sys.executable, "pipelines/training_pipeline.py"],
+                check=True
+            )
+        except Exception as pipeline_error:
+            print(f"Failed to launch training pipeline: {pipeline_error}")
+            raise
