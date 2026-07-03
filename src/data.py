@@ -19,3 +19,12 @@ def split_data(df: pd.DataFrame, target_col: str = 'Sales', test_size: float = 0
         X, y, test_size=test_size, shuffle=False
     )
     return X_train, X_val, y_train, y_val
+
+if __name__ == "__main__":
+    import os
+    print("Running Data Ingestion...")
+    raw_df = load_data("data/raw/train.csv")
+    
+    os.makedirs("data/processed", exist_ok=True)
+    raw_df.to_csv("data/processed/clean_data.csv", index=False)
+    print("Saved clean_data.csv")
