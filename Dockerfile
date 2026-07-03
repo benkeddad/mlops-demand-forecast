@@ -29,4 +29,4 @@ ENV PREFECT_API_URL=http://127.0.0.1:4200/api
 EXPOSE 7860
 
 # 8. Start MLflow and Prefect in the background, then launch your FastAPI application
-CMD ["sh", "-c", "mlflow server --host 127.0.0.1 --port 5000 & prefect server start --host 127.0.0.1 --port 4200 & uvicorn app.main:app --host 0.0.0.0 --port 7860 --reload --reload-dir data/raw --reload-include *.csv"]
+CMD ["sh", "-c", "mlflow server --host 127.0.0.1 --port 5000 & prefect server start --host 127.0.0.1 --port 4200 & sleep 15 && uvicorn app.main:app --host 0.0.0.0 --port 7860 --reload --reload-dir data/raw --reload-include *.csv"]
