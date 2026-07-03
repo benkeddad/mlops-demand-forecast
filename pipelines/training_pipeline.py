@@ -1,20 +1,31 @@
 import os
-import sys
+import subprocess
+from prefect import flow, task
 
-# Insert the project root directory into Python's search path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Point to the root directory
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-from src.train import run_training
+@task(name="1. DVC: Data Ingestion", retries=1)
+def dvc_ingest():
+    print("Triggering DVC Ingest Stage...")
+    subprocess.run(["dvc", "repro", "ingest"], cwd=PROJECT_ROOT, check=True)
 
-def main():
-    print("Starting ML Pipeline...")
-    data_file = "data/raw/train.csv"
-    
-    if not os.path.exists(data_file):
-        raise FileNotFoundError(f"Data file not found at {data_file}. Please copy train.csv here.")
-        
-    run_training(data_file)
-    print("Pipeline executed successfully.")
+@task(name="2. DVC: Feature Engineering")
+def dvc_featurize():
+    print("Triggering DVC Feature Engineering Stage...")
+    subprocess.run(["dvc", "repro", "featurize"], cwd=PROJECT_ROOT, check=True)
+
+@task(name="3. DVC: Model Training")
+def dvc_train():
+    print("Triggering DVC Training Stage...")
+    subprocess.run(["dvc", "repro", "train"], cwd=PROJECT_ROOT, check=True)
+
+@flow(name="Rossmann-Enterprise-Pipeline")
+def ml_training_pipeline():
+    # Prefect tracks the execution order, DVC handles the actual caching logic
+    dvc_ingest()
+    dvc_featurize()
+    dvc_train()
 
 if __name__ == "__main__":
-    main()
+    ml_training_pipeline()
