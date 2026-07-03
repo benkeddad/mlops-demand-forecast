@@ -10,7 +10,7 @@ import hashlib
 import mlflow.xgboost
 import pandas as pd
 from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from pydantic import BaseModel
 
 
@@ -252,6 +252,11 @@ async def predict_batch(file: UploadFile = File(...)):
     )
     return response
 
-@app.get("/")
+@app.get("/health", summary="Check API and Model status")
 def health_check():
     return {"status": "API active", "model_loaded": _model is not None}
+
+@app.get("/", include_in_schema=False)
+def redirect_to_docs():
+    # This automatically sends anyone visiting the main URL straight to the dashboard
+    return RedirectResponse(url="/docs")
