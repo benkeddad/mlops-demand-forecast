@@ -256,7 +256,7 @@ async def predict_batch(file: UploadFile = File(...)):
 def health_check():
     return {"status": "API active", "model_loaded": _model is not None}
 
-@app.get("/", include_in_schema=False)
-def redirect_to_docs():
-    # This automatically sends anyone visiting the main URL straight to the dashboard
+@app.get("/")
+def read_root():
+    # This automatically redirects anyone visiting the root to the /docs page
     return RedirectResponse(url="/docs")
