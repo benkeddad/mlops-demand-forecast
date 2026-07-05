@@ -9,17 +9,15 @@ RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy pre-initialized DVC configurations and tracking files
-COPY .dvc/ .dvc/
-COPY dvc.yaml .
-COPY dvc.lock .
-
-# Copy your application modules
+# Copy your application modules FIRST
 COPY app/ app/
 COPY pipelines/ pipelines/
 COPY src/ src/
 COPY data/raw/train.csv data/raw/train.csv
 COPY monitoring/ monitoring/
 
+# Initialize DVC NOW so it encapsulates project structure safely
+RUN dvc init --no-scm --force
+
 # Start FastAPI and watch for CSV modifications inside data/raw
-CMD ["sh", "-c", "mlflow server --host 127.0.0.1 --port 5000 & prefect server start --host 127.0.0.1 --port 4200 & sleep 15 && uvicorn app.main:app --host 0.0.0.0 --port 7860 --reload --reload-dir data/raw --reload-include *.csv"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "data/raw", "--reload-include", "*.csv"]
