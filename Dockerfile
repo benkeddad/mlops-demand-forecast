@@ -15,8 +15,9 @@ COPY pipelines/ pipelines/
 COPY src/ src/
 COPY data/raw/train.csv data/raw/train.csv
 COPY monitoring/ monitoring/
+COPY dvc.yaml .
 
-# Initialize DVC NOW so it encapsulates project structure safely
+# Initialize DVC safely
 RUN dvc init --no-scm --force
 
 # Start FastAPI and watch for CSV modifications inside data/raw
