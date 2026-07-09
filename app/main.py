@@ -1,262 +1,136 @@
-import io
 import os
 import sys
-import logging
+import io
 import asyncio
+import asyncpg
 import subprocess
-import shutil
-from contextlib import asynccontextmanager
-import hashlib
-import mlflow.xgboost
 import pandas as pd
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import StreamingResponse, RedirectResponse
-from pydantic import BaseModel
+from contextlib import asynccontextmanager
+from sqlalchemy import create_engine, text
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import RedirectResponse, StreamingResponse
+import mlflow.pyfunc
+from feast import FeatureStore
 
-
-# ---------------------------------------------------------------------------
-# Logging & Config
-# ---------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
-logger = logging.getLogger("sales_api")
-
-MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
-
-# This must match the registered_model_name in your training script
+# Database and MLflow Configurations
+DB_URL = os.getenv("DATABASE_URL", "postgresql://user:password@postgres:5432/rossmann")
 MODEL_URI = os.getenv("MODEL_URI", "models:/Rossmann_XGBoost_Model/latest")
 
-mlflow.set_tracking_uri(MLFLOW_URI)
-mlflow.set_registry_uri(MLFLOW_URI)
+_mlflow_uri = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+mlflow.set_tracking_uri(_mlflow_uri)
 
-# ---------------------------------------------------------------------------
-# Model state & Loading
-# ---------------------------------------------------------------------------
 _model = None
-_model_load_error = None
-
-FEATURE_COLUMNS = [
-    "Store",
-    "DayOfWeek",
-    "Promo",
-    "StateHoliday",
-    "SchoolHoliday",
-    "Year",
-    "Month",
-    "Day"
-]
-
-
+feast_store = FeatureStore(repo_path="feature_repo")
 
 def _load_model() -> bool:
-    global _model, _model_load_error
-
+    """Attempts to pull the latest model wrapper from the MLflow registry."""
+    global _model
     try:
-        logger.info("Connecting to MLflow at: %s", MLFLOW_URI)
-        logger.info("Loading model from: %s", MODEL_URI)
-
-        _model = mlflow.xgboost.load_model(MODEL_URI)
-
-        _model_load_error = None
-        logger.info("Model loaded successfully from MLflow.")
+        _model = mlflow.pyfunc.load_model(MODEL_URI)
+        if 'app' in globals():
+            app.state.model = _model
+        print("Model successfully loaded from MLflow.")
         return True
-
-    except Exception as exc:
-        _model_load_error = str(exc)
-        logger.error("Model load failed: %s", _model_load_error)
+    except Exception as e:
+        print(f"Model loading postponed: {e}")
         return False
 
-def get_file_hash(filepath, chunk_size=8192):
-    """Calculates the MD5 hash of a file's contents."""
-    hasher = hashlib.md5()
-    with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+async def retry_load_model_on_startup():
+    """Background task that retries model loading until successful."""
+    while _model is None:
+        print("Initial model load failed or pending. Retrying connection to MLflow in 10 seconds...")
+        success = _load_model()
+        if success:
+            break
+        await asyncio.sleep(10)
 
-# Read the directory from the environment, default to "data/raw" if not set
-TRAIN_DIR = os.getenv("TRAIN_DATA_DIR", os.path.join("data", "raw"))
-
-# Dynamically set the paths
-TARGET_PATH = os.path.join(TRAIN_DIR, "train.csv")
-TRACKING_FILE = os.path.join(TRAIN_DIR, ".train_tracker")
-
-# --- Define the helper ---
-async def wait_and_reload(process, logger_instance):
-    """Waits for the training process to complete and reloads the model."""
-    # Run the blocking wait in a separate thread to avoid blocking the event loop
-    await asyncio.to_thread(process.wait)
-    logger_instance.info("Training pipeline finished. Reloading model...")
+async def handle_train_db_trigger(connection, pid, channel, payload):
+    print("Database modification noticed on 'train' table. Activating Prefect Pipeline...")
+    pipeline_script = os.path.normpath(os.path.join("pipelines", "training_pipeline.py"))
+    
+    proc = await asyncio.create_subprocess_exec(sys.executable, pipeline_script)
+    await proc.wait()
+    
     _load_model()
 
-async def _startup_logic():
-    model_loaded = _load_model()
+async def handle_predict_db_trigger(connection, pid, channel, payload):
+    current_model = app.state.model if hasattr(app, 'state') and hasattr(app.state, 'model') else _model
     
-    # 1. Clean up and mark for forcing immediately if no model could be loaded
-    if not model_loaded:
-        logger.info("No model loaded. Safely clearing inner contents of 'mlruns' to prevent soft-deleted experiment crashes...") 
+    if current_model is None:
+        print("Prediction aborted: No model is currently loaded inside application memory.")
+        return
         
-        MLRUNS_DIR = os.path.normpath("mlruns")
-        if os.path.exists(MLRUNS_DIR):
-            for item in os.listdir(MLRUNS_DIR):
-                item_path = os.path.join(MLRUNS_DIR, item)
-                try:
-                    if os.path.isdir(item_path):
-                        shutil.rmtree(item_path)
-                    else:
-                        os.remove(item_path)
-                except Exception as e:
-                    logger.warning(f"Could not clear inner item {item_path}: {e}")
-            
-            try:
-                trash_dir = os.path.join(MLRUNS_DIR, ".trash")
-                os.makedirs(trash_dir, exist_ok=True)
-                logger.info(f"Successfully recreated structural folder: {trash_dir}")
-            except Exception as e:
-                logger.error(f"Failed to recreate .trash directory: {e}")
-
-    if not os.path.exists(TARGET_PATH):
-        if not model_loaded:
-            logger.warning(f"No model found and no training data at {TARGET_PATH}.")
+    rows = await connection.fetch('SELECT id, store FROM test WHERE predicted_sales IS NULL')
+    if not rows:
         return
 
-    # 2. Data exists. Get its current CONTENT HASH instead of mtime.
-    current_hash = get_file_hash(TARGET_PATH)
-    last_hash = None
+    print(f"Batch prediction triggered. Processing {len(rows)} new rows...")
 
-    if os.path.exists(TRACKING_FILE):
-        with open(TRACKING_FILE, "r") as f:
-            last_hash = f.read().strip()
-            
-    # 3. Decide whether to trigger training based on CONTENT.
-    data_changed = current_hash != last_hash
+    entity_rows = [{"entity_id": int(row["store"])} for row in rows]
 
-    if data_changed or not model_loaded:
+    feature_response = feast_store.get_online_features(
+        features=[
+            "rossmann_features:Store", "rossmann_features:DayOfWeek", "rossmann_features:Promo",
+            "rossmann_features:StateHoliday", "rossmann_features:SchoolHoliday",
+            "rossmann_features:Year", "rossmann_features:Month", "rossmann_features:Day"
+        ],
+        entity_rows=entity_rows
+    ).to_df()
+
+    # Create a copy to safely transform features
+    features_only = feature_response[["Store", "DayOfWeek", "Promo", "StateHoliday", "SchoolHoliday", "Year", "Month", "Day"]].copy()
     
-        if data_changed:
-            # Always use DVC when data changed
-            logger.info("Content changes detected in train.csv! Triggering standard DVC pipeline verification.")
-            script_to_run = os.path.normpath(os.path.join("pipelines", "training_pipeline.py"))
-            cmd = [sys.executable, script_to_run]
+    # Map categorical holiday strings back to integers
+    holiday_map = {"0": 0, "a": 1, "b": 2, "c": 3}
+    features_only["StateHoliday"] = (
+        features_only["StateHoliday"].astype(str).str.strip()
+        .map(holiday_map).fillna(0).astype(int)
+    )
+
+    # Coerce everything to int to align with your XGBoost training matrix
+    features_only = features_only.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
     
-        else:
-            # Data unchanged but model missing
-            logger.info("MLflow model missing! Data unchanged, running train.py directly.")
-            script_to_run = os.path.normpath(os.path.join("src", "train.py"))
-            cmd = [sys.executable, script_to_run]
+    # Run batch inference
+    predictions = current_model.predict(features_only)
     
-        with open(TRACKING_FILE, "w") as f:
-            f.write(current_hash)
+    update_data = [(float(pred), int(row["id"])) for pred, row in zip(predictions, rows)]
+    
+    await connection.executemany(
+        'UPDATE test SET predicted_sales = $1 WHERE id = $2', 
+        update_data
+    )
+    print(f"Batch prediction successfully written to database for {len(rows)} records.")
+    
+async def run_postgres_event_loop():
+    while True:
         try:
-            process = subprocess.Popen(cmd, env=os.environ.copy())
-            asyncio.create_task(wait_and_reload(process, logger))
-        except Exception as exc:
-            logger.error("Orchestration failed on startup: %s", exc)
-    
-    else:
-        logger.info("Model loaded successfully and train.csv content is identical. Ready to serve predictions.")
+            conn = await asyncpg.connect(DB_URL)
+            await conn.add_listener('train_changed', handle_train_db_trigger)
+            await conn.add_listener('test_inserted', handle_predict_db_trigger)
+            print("Successfully bound persistent notification listeners to PostgreSQL channels.")
+            while True:
+                await asyncio.sleep(5)
+        except Exception as err:
+            print(f"Database connection dropped ({err}). Retrying connection loop in 5 seconds...")
+            await asyncio.sleep(5)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Run the startup logic in the background so it doesn't block the API from starting
-    task = asyncio.create_task(_startup_logic())
+    if not _load_model():
+        asyncio.create_task(retry_load_model_on_startup())
+        
+    listener_worker = asyncio.create_task(run_postgres_event_loop())
     yield
-    task.cancel()
+    listener_worker.cancel()
 
-app = FastAPI(title="Sales Forecasting API", lifespan=lifespan if False else lifespan)
+app = FastAPI(title="Event-Driven Demand Forecast API", lifespan=lifespan)
+app.state.model = _model
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
-@app.post("/reload-model", summary="Force a model reload now")
-def reload_model():
-    success = _load_model()
-    if success:
-        return {"status": "Model reloaded successfully.", "model_uri": MODEL_URI}
-    raise HTTPException(
-        status_code=503,
-        detail={"error": "Reload failed.", "reason": _model_load_error},
-    )
-
-
-@app.post("/upload", summary="Upload new data file")
-async def upload_new_data(file: UploadFile = File(...)):
-    """Saves raw data to the designated local directory."""
-    
-    # Save the uploaded file
-    try:
-        os.makedirs(os.path.dirname(TARGET_PATH), exist_ok=True)
-        with open(TARGET_PATH, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        logger.info("File saved to %s", TARGET_PATH)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"File save error: {exc}")
-
-    return {
-        "status": "File uploaded and saved successfully.",
-        "target_path": TARGET_PATH
-    }
-
-@app.post("/predict-batch", summary="Predict sales for a CSV of store/day rows")
-async def predict_batch(file: UploadFile = File(...)):
-    if _model is None: raise HTTPException(status_code=503, detail="Model not loaded yet. Please try again later. or train a model using /upload endpoint or load a model using /reload-model endpoint.")
-
-    try:
-        contents = await file.read()
-        df = pd.read_csv(io.BytesIO(contents))
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid CSV: {exc}")
-
-    # Auto-expand Date column
-    if "Date" in df.columns:
-        missing = [c for c in ("Year", "Month", "Day", "DayOfWeek") if c not in df.columns]
-        if missing:
-            try:
-                dt = pd.to_datetime(df["Date"])
-                if "Year"      in missing: df["Year"]      = dt.dt.year
-                if "Month"     in missing: df["Month"]     = dt.dt.month
-                if "Day"       in missing: df["Day"]       = dt.dt.day
-                if "DayOfWeek" in missing: df["DayOfWeek"] = dt.dt.dayofweek
-            except Exception:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Failed to parse 'Date' column — expected YYYY-MM-DD.",
-                )
-
-    # Normalise StateHoliday
-    if "StateHoliday" in df.columns:
-        df["StateHoliday"] = (
-            df["StateHoliday"].astype(str).str.strip()
-            .map({"0": 0, "a": 1, "b": 2, "c": 3})
-            .fillna(0).astype(int)
-        )
-
-    missing_cols = [c for c in FEATURE_COLUMNS if c not in df.columns]
-    if missing_cols:
-        raise HTTPException(
-            status_code=400,
-            detail=f"CSV is missing columns: {missing_cols}. "
-                   "Include a 'Date' column or Year/Month/Day/DayOfWeek individually.",
-        )
-
-    try:
-        df["predicted_sales"] = _model.predict(df[FEATURE_COLUMNS]).round(2).tolist()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}")
-
-    stream = io.StringIO()
-    df.to_csv(stream, index=False)
-    response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
-    response.headers["Content-Disposition"] = (
-        "attachment; filename=rossmann_batch_predictions.csv"
-    )
-    return response
-
-@app.get("/health", summary="Check API and Model status")
-def health_check():
-    return {"status": "API active", "model_loaded": _model is not None}
+@app.get("/health")
+def health():
+    current_model = app.state.model if hasattr(app, 'state') and hasattr(app.state, 'model') else _model
+    return {"status": "active", "model_ready": current_model is not None}
 
 @app.get("/", include_in_schema=False)
 def redirect_to_docs():
-    # This automatically sends anyone visiting the main URL straight to the dashboard
     return RedirectResponse(url="/docs")

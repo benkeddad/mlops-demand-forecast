@@ -1,5 +1,21 @@
 services:
-  # MLflow Tracking Server
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: rossmann
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
   mlflow:
     image: ghcr.io/mlflow/mlflow:latest
     ports:
@@ -14,27 +30,28 @@ services:
         --default-artifact-root /mlflow/artifacts
         --allowed-hosts "*"
 
-  # Prefect Orchestration Server
   prefect:
     image: prefecthq/prefect:2.14-python3.10
     ports:
       - "4200:4200"
     command: prefect server start --host 0.0.0.0
 
-  # FastAPI Application
   api:
     build: .
     ports:
       - "8000:8000"
     volumes:
-      #- .:/app # Maps your local workspace to /app inside the container
-      - mlflow_data:/mlflow # <--- FIX 2: Shared volume so the API can physically read the model artifacts
+      - mlflow_data:/mlflow
     environment:
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - PREFECT_API_URL=http://prefect:4200/api
-      - WATCHFILES_FORCE_POLLING=true
+      - DATABASE_URL=postgresql://user:password@postgres:5432/rossmann
     depends_on:
+      - postgres
+      - redis
       - mlflow
       - prefect
+
 volumes:
   mlflow_data:
+  pg_data:

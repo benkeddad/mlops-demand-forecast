@@ -26,3 +26,9 @@ evidently>=0.4.0
 
 # --- Development & Background Tasks ---
 watchdog>=3.0.0
+
+feast[postgres]
+psycopg[binary,pool]
+asyncpg==0.29.0
+psycopg2-binary==2.9.0
+sqlalchemy==2.0.0

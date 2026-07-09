@@ -1,30 +1,26 @@
+import os
 import pandas as pd
+from sqlalchemy import create_engine
 from sklearn.model_selection import train_test_split
 
-def load_data(file_path: str) -> pd.DataFrame:
-    """Loads raw data from an Excel or CSV file."""
-    if file_path.endswith('.xlsx'):
-        df = pd.read_excel(file_path)
-    else:
-        df = pd.read_csv(file_path)
+DB_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/rossmann")
+
+def load_data_from_db() -> pd.DataFrame:
+    engine = create_engine(DB_URL)
+    df = pd.read_sql("SELECT * FROM train", engine)
     return df
 
-def split_data(df: pd.DataFrame, target_col: str = 'Sales', test_size: float = 0.2):
-    """Splits data temporally or randomly into train and validation sets."""
-    # Assuming chronological order for time-series; shuffle=False is critical
-    X = df.drop(columns=[target_col])
+def split_data(df: pd.DataFrame, target_col: str):
+    """Splits the processed features into training and validation sets."""
+    # Drop the target and any Feast online store identifiers before splitting
+    X = df.drop(columns=[target_col, "entity_id", "event_timestamp"], errors="ignore")
     y = df[target_col]
-    
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=test_size, shuffle=False
-    )
-    return X_train, X_val, y_train, y_val
+    return train_test_split(X, y, test_size=0.2, random_state=42)
 
 if __name__ == "__main__":
-    import os
-    print("Running Data Ingestion...")
-    raw_df = load_data("data/raw/train.csv")
+    print("Running Data Ingestion from DB...")
+    raw_df = load_data_from_db()
     
     os.makedirs("data/processed", exist_ok=True)
-    raw_df.to_csv("data/processed/clean_data.csv", index=False)
-    print("Saved clean_data.csv")
+    raw_df.to_parquet("data/processed/clean_data.parquet", index=False)
+    print("Saved clean_data.parquet")

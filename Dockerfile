@@ -9,16 +9,18 @@ RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy your application modules FIRST
+# Copy your application modules
 COPY app/ app/
 COPY pipelines/ pipelines/
 COPY src/ src/
-COPY data/raw/train.csv data/raw/train.csv
 COPY monitoring/ monitoring/
 COPY dvc.yaml .
+
+# Copy your Feast repository configurations so the API can talk to Redis
+COPY feature_repo/ feature_repo/
 
 # Initialize DVC safely
 RUN dvc init --no-scm --force
 
-# Start FastAPI and watch for CSV modifications inside data/raw
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "data/raw", "--reload-include", "*.csv"]
+# Start FastAPI normally without the obsolete CSV file-watching parameters
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

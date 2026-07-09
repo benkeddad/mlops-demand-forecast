@@ -2,19 +2,11 @@ import pandas as pd
 import mlflow
 import mlflow.xgboost
 import os
-import subprocess
-import sys
-
-
-# 1. Only import what is needed for the ML phase
 from data import split_data
 from model import get_model
 from evaluate import calculate_rmspe
 
-# Respect the MLFLOW_TRACKING_URI env var (set to http://mlflow:5000 in Docker,
-# falls back to localhost for local runs).
 _mlflow_uri = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
-
 mlflow.set_tracking_uri(_mlflow_uri)
 mlflow.set_registry_uri(_mlflow_uri)
 
@@ -22,64 +14,33 @@ REGISTERED_MODEL_NAME = "Rossmann_XGBoost_Model"
 
 def run_training(processed_data_path: str):
     print(f"Loading processed features from {processed_data_path}...")
+    processed_df = pd.read_parquet(processed_data_path)
 
-    # 2. Load the data that features.py already prepared and saved
-    processed_df = pd.read_csv(processed_data_path)
-
-    # 3. Split Data
     X_train, X_val, y_train, y_val = split_data(processed_df, target_col='Sales')
-
-
-    # 4. Initialize MLflow
-    experiment_name = "Rossmann_Sales_Forecasting"
-    
-    try:
-        mlflow.set_experiment(experiment_name)
-    
-    except Exception as exc:
-        print(f"Failed to use experiment '{experiment_name}': {exc}")
-    
-        experiment_name = f"Rossmann_Sales_Forecasting_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
-        print(f"Trying fallback experiment: {experiment_name}")
-    
-        mlflow.set_experiment(experiment_name)
-
+    mlflow.set_experiment("Rossmann_Sales_Forecasting")
 
     with mlflow.start_run():
-        # 5. Train Model
+        # Store metadata reference to the exact parquet data used for training
+        dataset = mlflow.data.from_pandas(processed_df, source=processed_data_path)
+        mlflow.log_input(dataset, context="training")
+
         model = get_model(n_estimators=150, max_depth=8)
         model.fit(X_train, y_train)
 
-        # 6. Evaluate
         predictions = model.predict(X_val)
         rmspe_score = calculate_rmspe(y_val.values, predictions)
 
-        # 7. Log to MLflow
         mlflow.log_param("model_type", "XGBRegressor")
         mlflow.log_param("n_estimators", 150)
         mlflow.log_param("max_depth", 8)
         mlflow.log_metric("val_rmspe", rmspe_score)
 
-        # Log and register the model artifact
         mlflow.xgboost.log_model(
             xgb_model=model,
             artifact_path="xgboost_model",
             registered_model_name=REGISTERED_MODEL_NAME
         )
-
-        print(f"Training completed successfully. RMSPE: {rmspe_score:.4f}")
-        print(f"Model registered in MLflow as: {REGISTERED_MODEL_NAME}")
-
-
+        print(f"Training completed. RMSPE: {rmspe_score:.4f}")
 
 if __name__ == "__main__":
-    features_file = "data/processed/train_features.csv"
-
-    if not os.path.exists(features_file):
-        print(f"{features_file} not found.")
-        subprocess.run(
-            [sys.executable, "pipelines/training_pipeline.py"],
-            check=True
-        )
-    else:
-        run_training(features_file)
+    run_training("data/processed/train_features.parquet")
