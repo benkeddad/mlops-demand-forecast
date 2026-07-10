@@ -3,7 +3,7 @@ import pandas as pd
 from sqlalchemy import create_engine
 from sklearn.model_selection import train_test_split
 
-DB_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/rossmann")
+DB_URL = os.getenv("DATABASE_URL", "postgresql://user:Password@localhost:5432/rossmann")
 
 def load_data_from_db() -> pd.DataFrame:
     engine = create_engine(DB_URL)

@@ -3,22 +3,32 @@ import pandas as pd
 from sqlalchemy import create_engine
 
 # FIX 1: Read the DATABASE_URL environment variable set in docker-compose
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@postgres:5432/rossmann")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:Password@postgres:5432/rossmann")
 engine = create_engine(DATABASE_URL)
 
+import pandas as pd
+# ... (Your existing database engine connection code goes here)
+
 print("Reading your CSV file...")
-# This path is correct because the Dockerfile copies your data folder to /app/data
-df = pd.read_csv("data/raw/train.csv")  
+df = pd.read_csv("data/raw/train.csv", low_memory=False)
+
+# 1. Convert CSV column names to lowercase to match the PostgreSQL schema exactly
+df.columns = df.columns.str.lower()
+
+# 2. FIX: Convert the string dates to proper datetime objects
+# Using dayfirst=True handles European DD/MM/YYYY formats perfectly
+df['date'] = pd.to_datetime(df['date'], dayfirst=True)
 
 print("Uploading records to PostgreSQL...")
-# FIX 2: Use chunksize so loading 1M+ rows doesn't break the container
 df.to_sql("train", engine, if_exists="append", index=False, chunksize=10000)
 
 print(f"Done! Successfully loaded {len(df)} rows to the train table.")
 
 
 print("Reading test.csv file...")
-test_df = pd.read_csv("data/raw/test.csv")
+test_df = pd.read_csv("data/test.csv")
 
 print("Uploading records to test table...")
+test_df.columns = test_df.columns.str.lower()
+test_df['date'] = pd.to_datetime(test_df['date'], dayfirst=True)
 test_df.to_sql("test", engine, if_exists="append", index=False, chunksize=10000)

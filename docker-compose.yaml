@@ -9,7 +9,7 @@ services:
     container_name: rossmann_postgres
     environment:
       POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD: Password
       POSTGRES_DB: rossmann
     ports:
       - "5432:5432"
@@ -69,7 +69,7 @@ services:
       - mlflow_data:/mlflow 
     working_dir: /app
     environment:
-      - DATABASE_URL=postgresql://user:password@postgres:5432/rossmann
+      - DATABASE_URL=postgresql://user:Password@postgres:5432/rossmann
       - MODEL_URI=models:/Rossmann_XGBoost_Model/latest
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - PREFECT_API_URL=http://prefect:4200/api

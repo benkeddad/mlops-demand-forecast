@@ -5,14 +5,14 @@ entity_key_serialization_version: 2
 
 offline_store:
   type: postgres
-  host: localhost
+  host: postgres
   port: 5432
   database: rossmann
   db_schema: public
-  user: postgres
-  password: password
+  user: user
+  password: Password
   sslmode: disable
 
 online_store:
   type: redis
-  connection_string: "localhost:6379"
+  connection_string: "redis:6379"

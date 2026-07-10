@@ -4,73 +4,61 @@
 DROP TRIGGER IF EXISTS test_insert_trig ON test CASCADE;
 DROP FUNCTION IF EXISTS notify_test_insert() CASCADE;
 
-DROP TRIGGER IF EXISTS train_changed_trigger ON train CASCADE;
-DROP FUNCTION IF EXISTS notify_train_changed() CASCADE;
+DROP TRIGGER IF EXISTS train_alter_trig ON train CASCADE;
+DROP FUNCTION IF EXISTS notify_train_change() CASCADE;
 
 DROP TABLE IF EXISTS test CASCADE;
 DROP TABLE IF EXISTS train CASCADE;
 
 -- ============================================================
--- 2. TRIGGER FUNCTIONS
+-- 2. TABLE CREATION
 -- ============================================================
--- Trigger function for the test table inserts
-CREATE OR REPLACE FUNCTION notify_test_insert()
-RETURNS TRIGGER AS $$
-BEGIN
-    PERFORM pg_notify('test_inserted', 'new_data');
-    RETURN NEW; -- Row-level triggers return NEW
-END;
-$$ LANGUAGE plpgsql;
-
--- Trigger function for the train table updates
-CREATE OR REPLACE FUNCTION notify_train_changed()
-RETURNS TRIGGER AS $$
-BEGIN
-    PERFORM pg_notify('train_changed', 'new_training_data');
-    RETURN NULL; -- Statement-level triggers return NULL
-END;
-$$ LANGUAGE plpgsql;
-
--- ============================================================
--- 3. TABLE CREATION & TRIGGER BINDINGS
--- ============================================================
--- Create the training dataset table
 CREATE TABLE train (
     id SERIAL PRIMARY KEY,
-    store INT NOT NULL,
-    dayofweek INT,
-    sales INT,
-    customers INT,
-    open INT,
-    promo INT,
-    stateholiday VARCHAR(10),
-    schoolholiday INT,
-    year INT,
-    month INT,
-    day INT
+    store INTEGER, 
+    dayofweek INTEGER, 
+    date DATE, 
+    sales INTEGER, 
+    customers INTEGER, 
+    open INTEGER, 
+    promo INTEGER, 
+    stateholiday VARCHAR(10), 
+    schoolholiday INTEGER
 );
 
--- Bind trigger to the train table
-CREATE TRIGGER train_changed_trigger
-AFTER INSERT ON train
-FOR EACH STATEMENT
-EXECUTE FUNCTION notify_train_changed();
-
--- Recreate the test table exactly as verified
 CREATE TABLE test (
-    Id SERIAL PRIMARY KEY, 
-    Store INTEGER, 
-    DayOfWeek INTEGER, 
-    Date DATE, 
-    Open INTEGER,            -- Included column
-    Promo INTEGER, 
-    StateHoliday VARCHAR(10), 
-    SchoolHoliday INTEGER, 
+    id SERIAL PRIMARY KEY, 
+    store INTEGER, 
+    dayofweek INTEGER, 
+    date DATE, 
+    open INTEGER,
+    promo INTEGER, 
+    stateholiday VARCHAR(10), 
+    schoolholiday INTEGER, 
     predicted_sales FLOAT
 );
 
--- Reattach the row-level trigger for FastAPI exactly as verified
+-- ============================================================
+-- 3. TRIGGER FUNCTIONS & BINDINGS
+-- ============================================================
+CREATE OR REPLACE FUNCTION notify_train_change() RETURNS trigger AS $$
+BEGIN
+    PERFORM pg_notify('train_changed', 'update');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER train_alter_trig 
+AFTER INSERT OR UPDATE OR DELETE ON train
+FOR EACH STATEMENT EXECUTE FUNCTION notify_train_change();
+
+CREATE OR REPLACE FUNCTION notify_test_insert() RETURNS trigger AS $$
+BEGIN
+    PERFORM pg_notify('test_inserted', NEW.id::text);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE TRIGGER test_insert_trig 
 AFTER INSERT ON test
-FOR EACH ROW 
-EXECUTE FUNCTION notify_test_insert();
+FOR EACH ROW EXECUTE FUNCTION notify_test_insert();

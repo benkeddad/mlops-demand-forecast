@@ -8,7 +8,7 @@ from feast import FeatureStore
 # ============================================================
 # CONFIGURATION & ENVIRONMENT SETUP
 # ============================================================
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@postgres:5432/rossmann")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:Password@postgres:5432/rossmann")
 MODEL_URI = os.getenv("MODEL_URI", "models:/Rossmann_XGBoost_Model/latest")
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 

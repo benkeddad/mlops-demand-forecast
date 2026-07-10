@@ -24,8 +24,9 @@ python src/seed_db.py
 echo "Initializing DVC in the live volume..."
 dvc init --no-scm --force
 
-echo "Executing DVC pipeline (Data Ingestion -> Feature Engineering -> Training)..."
-dvc repro
+echo "Executing Training Pipeline via Prefect..."
+
+python pipelines/training_pipeline.py
 # -----------------------
 
 echo "Calculating initial batch predictions for test data..."
