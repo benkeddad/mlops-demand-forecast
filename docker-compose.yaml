@@ -1,6 +1,12 @@
+version: '3.8'
+
 services:
+  # ==========================================
+  # 1. Database & Feature Store Infrastructure
+  # ==========================================
   postgres:
-    image: postgres:15
+    image: postgres:15-alpine
+    container_name: rossmann_postgres
     environment:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: password
@@ -8,16 +14,25 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pg_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - rossmann_network
 
   redis:
-    image: redis:7
+    image: redis:7-alpine
+    container_name: rossmann_redis
     ports:
       - "6379:6379"
+    networks:
+      - rossmann_network
 
+  # ==========================================
+  # 2. Orchestration & Tracking 
+  # ==========================================
   mlflow:
     image: ghcr.io/mlflow/mlflow:latest
+    container_name: rossmann_mlflow
     ports:
       - "5000:5000"
     volumes:
@@ -29,29 +44,48 @@ services:
         --backend-store-uri sqlite:////mlflow/mlflow.db
         --default-artifact-root /mlflow/artifacts
         --allowed-hosts "*"
+    networks:
+      - rossmann_network
 
   prefect:
     image: prefecthq/prefect:2.14-python3.10
+    container_name: rossmann_prefect
     ports:
       - "4200:4200"
     command: prefect server start --host 0.0.0.0
+    networks:
+      - rossmann_network
 
+  # ==========================================
+  # 3. Application Layer
+  # ==========================================
   api:
     build: .
+    container_name: rossmann_api
     ports:
       - "8000:8000"
     volumes:
-      - mlflow_data:/mlflow
+      - .:/app 
+      - mlflow_data:/mlflow 
+    working_dir: /app
     environment:
+      - DATABASE_URL=postgresql://user:password@postgres:5432/rossmann
+      - MODEL_URI=models:/Rossmann_XGBoost_Model/latest
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - PREFECT_API_URL=http://prefect:4200/api
-      - DATABASE_URL=postgresql://user:password@postgres:5432/rossmann
+      - WATCHFILES_FORCE_POLLING=true
     depends_on:
       - postgres
       - redis
       - mlflow
       - prefect
+    networks:
+      - rossmann_network
 
 volumes:
+  postgres_data:
   mlflow_data:
-  pg_data:
+
+networks:
+  rossmann_network:
+    driver: bridge

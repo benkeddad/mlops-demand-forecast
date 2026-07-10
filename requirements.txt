@@ -27,7 +27,8 @@ evidently>=0.4.0
 # --- Development & Background Tasks ---
 watchdog>=3.0.0
 
-feast[postgres]
+
+feast[postgres,redis]
 psycopg[binary,pool]
 asyncpg==0.29.0
 psycopg2-binary==2.9.0

@@ -1,25 +1,24 @@
-# Add io and create_engine imports to the top of app/main.py
-import io
+import os
+import pandas as pd
 from sqlalchemy import create_engine
-from fastapi import UploadFile, File
 
-@app.post("/upload", summary="Upload new training data directly to the database")
-async def upload_new_data(file: UploadFile = File(...)):
-    try:
-        # Read the incoming file directly into memory
-        contents = await file.read()
-        df = pd.read_csv(io.BytesIO(contents))
-        
-        # Connect to the database
-        engine = create_engine(DB_URL)
-        
-        # Append the new records to your train table
-        # This insertion automatically fires your 'train_changed' database trigger
-        df.to_sql("train", engine, if_exists="append", index=False)
-        
-        return {
-            "status": "Success", 
-            "message": f"Inserted {len(df)} rows into the train table. Training pipeline triggered."
-        }
-    except Exception as exc:
-        return {"status": "Error", "detail": str(exc)}
+# FIX 1: Read the DATABASE_URL environment variable set in docker-compose
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@postgres:5432/rossmann")
+engine = create_engine(DATABASE_URL)
+
+print("Reading your CSV file...")
+# This path is correct because the Dockerfile copies your data folder to /app/data
+df = pd.read_csv("data/raw/train.csv")  
+
+print("Uploading records to PostgreSQL...")
+# FIX 2: Use chunksize so loading 1M+ rows doesn't break the container
+df.to_sql("train", engine, if_exists="append", index=False, chunksize=10000)
+
+print(f"Done! Successfully loaded {len(df)} rows to the train table.")
+
+
+print("Reading test.csv file...")
+test_df = pd.read_csv("data/raw/test.csv")
+
+print("Uploading records to test table...")
+test_df.to_sql("test", engine, if_exists="append", index=False, chunksize=10000)
