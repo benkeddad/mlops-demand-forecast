@@ -44,14 +44,26 @@ async def retry_load_model_on_startup():
             break
         await asyncio.sleep(10)
 
+async def run_training_and_reload():
+    """Runs the training pipeline completely in the background and reloads the model when done."""
+    try:
+        pipeline_script = os.path.normpath(os.path.join("pipelines", "training_pipeline.py"))
+        print("Background worker: Starting training pipeline execution...")
+        
+        # This blocks only this background worker, NOT the rest of FastAPI or the listeners
+        proc = await asyncio.create_subprocess_exec(sys.executable, pipeline_script)
+        await proc.wait()
+        
+        print("Background worker: Training pipeline finished! Reloading the new model from MLflow...")
+        _load_model()
+    except Exception as e:
+        print(f"Background worker error during training/reloading: {e}")
+
 async def handle_train_db_trigger(connection, pid, channel, payload):
-    print("Database modification noticed on 'train' table. Activating Prefect Pipeline...")
-    pipeline_script = os.path.normpath(os.path.join("pipelines", "training_pipeline.py"))
+    print("Database modification noticed on 'train' table. Handing off to background trainer...")
     
-    proc = await asyncio.create_subprocess_exec(sys.executable, pipeline_script)
-    await proc.wait()
-    
-    _load_model()
+    # Kicks off the process instantly in the background and frees up the database trigger loop immediately
+    asyncio.create_task(run_training_and_reload())
 
 async def handle_predict_db_trigger(connection, pid, channel, payload):
     current_model = app.state.model if hasattr(app, 'state') and hasattr(app.state, 'model') else _model
