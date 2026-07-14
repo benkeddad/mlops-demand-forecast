@@ -3,7 +3,9 @@ import sys
 import pandas as pd
 import mlflow.pyfunc
 from sqlalchemy import create_engine, text
-from feast import FeatureStore
+
+# Import your existing local processing logic
+from features import build_features
 
 # ============================================================
 # CONFIGURATION & ENVIRONMENT SETUP
@@ -17,9 +19,13 @@ mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 def main():
     engine = create_engine(DATABASE_URL)
     
-    # 1. FETCH UNPREDICTED ROWS FROM POSTGRESQL (Matches your trigger query)
+    # 1. FETCH UNPREDICTED ROWS WITH ALL THEIR TEMPORAL COLUMNS
     print("Fetching unpredicted records from the 'test' table...")
-    query = "SELECT id, store FROM test WHERE predicted_sales IS NULL;"
+    query = """
+        SELECT id, store, date, dayofweek, promo, stateholiday, schoolholiday 
+        FROM test 
+        WHERE predicted_sales IS NULL;
+    """
     
     try:
         df = pd.read_sql(query, engine)
@@ -41,37 +47,28 @@ def main():
         print(f"Failed to load model from MLflow: {e}")
         sys.exit(1)
 
-    # 3. GET ONLINE FEATURES FROM FEAST (Matches your trigger structure)
-    print("Connecting to Feast Feature Store...")
-    store = FeatureStore(repo_path="feature_repo") 
+    # 3. MAP COLUMNS AND PROCESS THE TEMPORAL FEATURES LOCALLY
+    # Map lowercase DB column names to what build_features expects
+    column_mapping = {
+        "store": "Store",
+        "dayofweek": "DayOfWeek",
+        "promo": "Promo",
+        "stateholiday": "StateHoliday",
+        "schoolholiday": "SchoolHoliday",
+        "date": "Date"
+    }
+    df_renamed = df.rename(columns=column_mapping)
     
-    # Map the entities exactly like your handle_predict_db_trigger function
-    entity_rows = [{"entity_id": int(row["store"])} for _, row in df.iterrows()]
-    
-    print("Retrieving features from Feast online store...")
-    feature_response = store.get_online_features(
-        features=[
-            "rossmann_features:Store", "rossmann_features:DayOfWeek", "rossmann_features:Promo",
-            "rossmann_features:StateHoliday", "rossmann_features:SchoolHoliday",
-            "rossmann_features:Year", "rossmann_features:Month", "rossmann_features:Day"
-        ],
-        entity_rows=entity_rows
-    ).to_df()
+    print("Processing date and categorical features locally...")
+    # This automatically splits 'Date' into 'Year', 'Month', and 'Day'
+    processed_df = build_features(df_renamed)
 
-    # 4. PROCESS FEATURES (Verbatim copy of your transformation logic)
-    features_only = feature_response[["Store", "DayOfWeek", "Promo", "StateHoliday", "SchoolHoliday", "Year", "Month", "Day"]].copy()
-    
-    # Map categorical holiday strings back to integers
-    holiday_map = {"0": 0, "a": 1, "b": 2, "c": 3}
-    features_only["StateHoliday"] = (
-        features_only["StateHoliday"].astype(str).str.strip()
-        .map(holiday_map).fillna(0).astype(int)
-    )
-
-    # Coerce everything to int to align with your XGBoost training matrix
+    # Enforce strict formatting and feature order to align with XGBoost matrix
+    expected_features = ["Store", "DayOfWeek", "Promo", "StateHoliday", "SchoolHoliday", "Year", "Month", "Day"]
+    features_only = processed_df[expected_features].copy()
     features_only = features_only.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
     
-    # 5. RUN BATCH INFERENCE
+    # 4. RUN BATCH INFERENCE
     print("Running batch inference...")
     try:
         predictions = model.predict(features_only)
@@ -79,14 +76,14 @@ def main():
         print(f"Prediction failed: {e}")
         sys.exit(1)
     
-    # 6. BULK WRITE PREDICTIONS BACK TO POSTGRESQL
+    # 5. BULK WRITE PREDICTIONS BACK TO POSTGRESQL
     print("Writing batch predictions back to 'test' table...")
     update_query = text("UPDATE test SET predicted_sales = :predicted_sales WHERE id = :id")
     
-    # Zip predictions back to their corresponding database IDs
+    # Map predictions back to the original database row IDs
     update_payload = [
-        {"predicted_sales": float(pred), "id": int(row["id"])} 
-        for pred, (_, row) in zip(predictions, df.iterrows())
+        {"predicted_sales": float(pred), "id": int(db_id)} 
+        for pred, db_id in zip(predictions, df["id"])
     ]
     
     with engine.begin() as conn:

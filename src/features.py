@@ -33,7 +33,6 @@ if __name__ == "__main__":
     try:
         clean_df = pd.read_parquet("data/processed/clean_data.parquet")
         
-        # FIX: Map lowercase Postgres columns to the expected capitalized names
         column_mapping = {
             "store": "Store",
             "dayofweek": "DayOfWeek",
@@ -57,9 +56,15 @@ if __name__ == "__main__":
         processed_df.to_parquet("data/processed/train_features.parquet", index=False)
         print("Saved train_features.parquet")
 
-        # Sync features to Redis via Feast
+        # FIX: Force full materialization across a massive window to guarantee Redis population
+        print("Syncing features to Redis via Feast...")
         subprocess.run(["feast", "apply"], cwd="feature_repo", check=True)
-        subprocess.run(["feast", "materialize-incremental", pd.Timestamp.now().isoformat()], cwd="feature_repo", check=True)
+        subprocess.run(
+            ["feast", "materialize", "2010-01-01T00:00:00", "2030-12-31T23:59:59"], 
+            cwd="feature_repo", 
+            check=True
+        )
+        print("Successfully materialized features into Redis.")
 
     except Exception as e:
         print(f"Pipeline error: {e}")

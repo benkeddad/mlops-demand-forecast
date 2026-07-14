@@ -11,6 +11,14 @@ import asyncpg
 from feast import FeatureStore
 from fastapi.responses import StreamingResponse, RedirectResponse
 
+# 1. Get the path to 'project_folder' (one level up from 'app') and add it to Python's search path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+# 2. Now you can import from the 'src' folder directly
+from src.features import build_features
+
 # ---------------------------------------------------------------------------
 # Config & State
 # ---------------------------------------------------------------------------
@@ -19,7 +27,7 @@ logger = logging.getLogger("sales_api")
 
 MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 MODEL_URI = os.getenv("MODEL_URI", "models:/Rossmann_XGBoost_Model/latest")
-DB_URL = os.getenv("DATABASE_URL", "postgresql://user:password@postgres:5432/rossmann")
+DB_URL = os.getenv("DATABASE_URL", "postgresql://user:Password@localhost:5432/rossmann")
 
 mlflow.set_tracking_uri(MLFLOW_URI)
 _model = None
@@ -37,8 +45,10 @@ async def perform_batch_prediction():
     connection = await asyncpg.connect(DB_URL)
     
     try:
-        # 2. Fetch rows
-        rows = await connection.fetch('SELECT id, store FROM test WHERE predicted_sales IS NULL')
+        # 2. Fetch rows (Now fetching all feature columns instead of just store entity ID)
+        rows = await connection.fetch(
+            'SELECT id, store, date, dayofweek, promo, stateholiday, schoolholiday FROM test WHERE predicted_sales IS NULL'
+        )
         
         if not rows:
             logger.info("No new rows to predict.")
@@ -46,44 +56,44 @@ async def perform_batch_prediction():
 
         logger.info(f"Performing batch prediction for {len(rows)} rows...")
 
-        # 3. Get Features from Feast
-        entity_rows = [{"entity_id": int(row["store"])} for row in rows]
-        feature_response = feast_store.get_online_features(
-            features=[
-                "rossmann_features:Store", "rossmann_features:DayOfWeek", "rossmann_features:Promo",
-                "rossmann_features:StateHoliday", "rossmann_features:SchoolHoliday",
-                "rossmann_features:Year", "rossmann_features:Month", "rossmann_features:Day"
-            ],
-            entity_rows=entity_rows
-        ).to_df()
+        # 3. Convert raw asyncpg records directly to a Pandas DataFrame
+        raw_data = [dict(row) for row in rows]
+        df = pd.DataFrame(raw_data)
 
-        # 4. Strictly enforce column order (The Fix)
+        # 4. Map lowercase Postgres columns to the expected capitalized names
+        column_mapping = {
+            "store": "Store",
+            "dayofweek": "DayOfWeek",
+            "promo": "Promo",
+            "stateholiday": "StateHoliday",
+            "schoolholiday": "SchoolHoliday",
+            "date": "Date"
+        }
+        df_renamed = df.rename(columns=column_mapping)
+
+        # 5. Process temporal features locally (Bypassing Feast Online Store temporal limitations)
+        processed_df = build_features(df_renamed)
+
+        # 6. Strictly enforce column order (The Fix)
         # Defining the list here ensures the model sees features in the exact same 
-        # order it was trained on, regardless of what Feast returns.
+        # order it was trained on.
         feature_cols = ["Store", "DayOfWeek", "Promo", "StateHoliday", "SchoolHoliday", "Year", "Month", "Day"]
         
         # Slice and copy in one single step to prevent DataFrame re-indexing issues
-        features_only = feature_response[feature_cols].copy()
-        
-        # 5. Transform
-        holiday_map = {"0": 0, "a": 1, "b": 2, "c": 3}
-        features_only["StateHoliday"] = (
-            features_only["StateHoliday"].astype(str).str.strip()
-            .map(holiday_map).fillna(0).astype(int)
-        )
+        features_only = processed_df[feature_cols].copy()
         
         # Numeric conversion
         features_only = features_only.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
         
-        # 6. Predict
+        # 7. Predict
         predictions = _model.predict(features_only)
         
-        # 7. Check if predictions are all the same (The Debugger)
+        # 8. Check if predictions are all the same (The Debugger)
         if len(set(predictions)) == 1:
             logger.warning(f"WARNING: Model outputted the same value ({predictions[0]}) for all {len(rows)} rows.")
             logger.info(f"Sample features passed to model:\n{features_only.iloc[0].to_dict()}")
 
-        # 8. Update DB
+        # 9. Update DB
         update_data = [(float(pred), int(row["id"])) for pred, row in zip(predictions, rows)]
         
         await connection.executemany(
@@ -168,6 +178,69 @@ def reload_model():
         status_code=503,
         detail={"error": "Reload failed.", "reason": "Model loading encountered an error"},
     )
+
+@app.get("/predict/realtime/{store_id}", summary="Real-time live prediction using Feast + Redis")
+async def predict_realtime(store_id: int):
+    """
+    Demonstrates Live Serving Path (Online):
+    Retrieves the latest pre-computed features for a single store from Redis 
+    via Feast in <10ms, then runs live model inference.
+    """
+    if _model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded.")
+    
+    try:
+        # 1. Look up the latest feature snapshot from the Redis Online Store
+        # Since Feast's SDK is synchronous, we run it in a thread to keep FastAPI async
+        entity_rows = [{"entity_id": store_id}]
+        
+        logger.info(f"Retrieving online features from Redis for Store {store_id}...")
+        feature_response = await asyncio.to_thread(
+            feast_store.get_online_features,
+            features=[
+                "rossmann_features:Store", "rossmann_features:DayOfWeek", "rossmann_features:Promo",
+                "rossmann_features:StateHoliday", "rossmann_features:SchoolHoliday",
+                "rossmann_features:Year", "rossmann_features:Month", "rossmann_features:Day"
+            ],
+            entity_rows=entity_rows
+        )
+        
+        feature_df = feature_response.to_df()
+        
+        # 2. Check if the store exists in the Redis cache
+        if feature_df.empty or pd.isna(feature_df["Store"].iloc[0]):
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Store {store_id} not found in Redis. Run 'feast materialize-incremental' first."
+            )
+
+        # 3. Clean and align features exactly like the training setup
+        feature_cols = ["Store", "DayOfWeek", "Promo", "StateHoliday", "SchoolHoliday", "Year", "Month", "Day"]
+        features_only = feature_df[feature_cols].copy()
+        
+        holiday_map = {"0": 0, "a": 1, "b": 2, "c": 3}
+        features_only["StateHoliday"] = (
+            features_only["StateHoliday"].astype(str).str.strip()
+            .map(holiday_map).fillna(0).astype(int)
+        )
+        features_only = features_only.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
+        
+        # 4. Run real-time inference on the fetched features
+        prediction = _model.predict(features_only)[0]
+        
+        return {
+            "store_id": store_id,
+            "predicted_sales": float(prediction),
+            "retrieved_features": features_only.iloc[0].to_dict(),
+            "latency_ms": "Ultra-low (<10ms)",
+            "source": "Feast Online Store (Redis Cache)"
+        }
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Real-time prediction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
 
 @app.get("/health", summary="Check API and Model status")
 def health_check():

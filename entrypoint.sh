@@ -12,20 +12,21 @@ echo "Applying Feast definitions..."
 cd feature_repo
 feast apply
 
+# --- THE FEAST FIX IS HERE ---
 echo "Materializing features to Redis..."
-CURRENT_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S")
-feast materialize-incremental $CURRENT_TIMESTAMP
+# Using a massive window to guarantee 2013-2015 data is caught regardless of TTL or current date
+feast materialize "2010-01-01T00:00:00" "2030-12-31T23:59:59"
 cd ..
+# -----------------------------
 
 echo "Loading initial raw CSV data into PostgreSQL..."
 python src/seed_db.py
 
-# --- THE FIX IS HERE ---
+# --- THE DVC FIX IS HERE ---
 echo "Initializing DVC in the live volume..."
 dvc init --no-scm --force
 
 echo "Executing Training Pipeline via Prefect..."
-
 python pipelines/training_pipeline.py
 # -----------------------
 
