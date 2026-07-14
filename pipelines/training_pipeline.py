@@ -1,4 +1,5 @@
 import os
+import sys
 import subprocess
 from prefect import flow, task
 
@@ -7,8 +8,9 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 @task(name="1. DVC: Data Ingestion", retries=1)
 def dvc_ingest():
-    print("Triggering DVC Ingest Stage...")
-    subprocess.run(["dvc", "repro", "ingest"], cwd=PROJECT_ROOT, check=True)
+    print("Triggering DVC Ingest Stage (FORCED)...")
+    # Added --force to bypass cache check
+    subprocess.run(["dvc", "repro", "--force", "ingest"], cwd=PROJECT_ROOT, check=True)
 
 @task(name="2. DVC: Feature Engineering")
 def dvc_featurize():
@@ -29,3 +31,4 @@ def ml_training_pipeline():
 
 if __name__ == "__main__":
     ml_training_pipeline()
+    print("Pipeline script finished")
