@@ -1,148 +1,179 @@
 import os
 import sys
-import io
+import logging
 import asyncio
-import asyncpg
 import subprocess
-import pandas as pd
 from contextlib import asynccontextmanager
-from sqlalchemy import create_engine, text
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import RedirectResponse, StreamingResponse
 import mlflow.pyfunc
+import pandas as pd
+from fastapi import FastAPI, HTTPException
+import asyncpg
 from feast import FeatureStore
+from fastapi.responses import StreamingResponse, RedirectResponse
 
-# Database and MLflow Configurations
-DB_URL = os.getenv("DATABASE_URL", "postgresql://user:password@postgres:5432/rossmann")
+# ---------------------------------------------------------------------------
+# Config & State
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
+logger = logging.getLogger("sales_api")
+
+MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 MODEL_URI = os.getenv("MODEL_URI", "models:/Rossmann_XGBoost_Model/latest")
+DB_URL = os.getenv("DATABASE_URL", "postgresql://user:password@postgres:5432/rossmann")
 
-_mlflow_uri = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
-mlflow.set_tracking_uri(_mlflow_uri)
-
+mlflow.set_tracking_uri(MLFLOW_URI)
 _model = None
 feast_store = FeatureStore(repo_path="feature_repo")
 
+# ---------------------------------------------------------------------------
+# The Shared Prediction Logic (Source of Truth)
+# ---------------------------------------------------------------------------
+async def perform_batch_prediction():
+    if _model is None:
+        logger.warning("Prediction skipped: No model loaded.")
+        return
+
+    # 1. Connect directly
+    connection = await asyncpg.connect(DB_URL)
+    
+    try:
+        # 2. Fetch rows
+        rows = await connection.fetch('SELECT id, store FROM test WHERE predicted_sales IS NULL')
+        
+        if not rows:
+            logger.info("No new rows to predict.")
+            return
+
+        logger.info(f"Performing batch prediction for {len(rows)} rows...")
+
+        # 3. Get Features from Feast
+        entity_rows = [{"entity_id": int(row["store"])} for row in rows]
+        feature_response = feast_store.get_online_features(
+            features=[
+                "rossmann_features:Store", "rossmann_features:DayOfWeek", "rossmann_features:Promo",
+                "rossmann_features:StateHoliday", "rossmann_features:SchoolHoliday",
+                "rossmann_features:Year", "rossmann_features:Month", "rossmann_features:Day"
+            ],
+            entity_rows=entity_rows
+        ).to_df()
+
+        # 4. Strictly enforce column order (The Fix)
+        # Defining the list here ensures the model sees features in the exact same 
+        # order it was trained on, regardless of what Feast returns.
+        feature_cols = ["Store", "DayOfWeek", "Promo", "StateHoliday", "SchoolHoliday", "Year", "Month", "Day"]
+        
+        # Slice and copy in one single step to prevent DataFrame re-indexing issues
+        features_only = feature_response[feature_cols].copy()
+        
+        # 5. Transform
+        holiday_map = {"0": 0, "a": 1, "b": 2, "c": 3}
+        features_only["StateHoliday"] = (
+            features_only["StateHoliday"].astype(str).str.strip()
+            .map(holiday_map).fillna(0).astype(int)
+        )
+        
+        # Numeric conversion
+        features_only = features_only.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
+        
+        # 6. Predict
+        predictions = _model.predict(features_only)
+        
+        # 7. Check if predictions are all the same (The Debugger)
+        if len(set(predictions)) == 1:
+            logger.warning(f"WARNING: Model outputted the same value ({predictions[0]}) for all {len(rows)} rows.")
+            logger.info(f"Sample features passed to model:\n{features_only.iloc[0].to_dict()}")
+
+        # 8. Update DB
+        update_data = [(float(pred), int(row["id"])) for pred, row in zip(predictions, rows)]
+        
+        await connection.executemany(
+            'UPDATE test SET predicted_sales = $1 WHERE id = $2', 
+            update_data
+        )
+        logger.info(f"Batch prediction written for {len(rows)} records.")
+
+    except Exception as e:
+        logger.error(f"Prediction failed: {e}")
+        
+    finally:
+        # Always close to prevent connection leaks
+        await connection.close()
+
+# ---------------------------------------------------------------------------
+# Loaders & Triggers
+# ---------------------------------------------------------------------------
 def _load_model() -> bool:
-    """Attempts to pull the latest model wrapper from the MLflow registry."""
     global _model
     try:
         _model = mlflow.pyfunc.load_model(MODEL_URI)
-        if 'app' in globals():
-            app.state.model = _model
-        print("Model successfully loaded from MLflow.")
+        logger.info("Model loaded successfully.")
         return True
     except Exception as e:
-        print(f"Model loading postponed: {e}")
+        logger.error(f"Load failed: {e}")
         return False
 
-async def retry_load_model_on_startup():
-    """Background task that retries model loading until successful."""
-    while _model is None:
-        print("Initial model load failed or pending. Retrying connection to MLflow in 10 seconds...")
-        success = _load_model()
-        if success:
-            break
-        await asyncio.sleep(10)
-
-async def run_training_and_reload():
-    """Runs the training pipeline completely in the background and reloads the model when done."""
-    try:
-        pipeline_script = os.path.normpath(os.path.join("pipelines", "training_pipeline.py"))
-        print("Background worker: Starting training pipeline execution...")
-        
-        # This blocks only this background worker, NOT the rest of FastAPI or the listeners
-        proc = await asyncio.create_subprocess_exec(sys.executable, pipeline_script)
-        await proc.wait()
-        
-        print("Background worker: Training pipeline finished! Reloading the new model from MLflow...")
-        _load_model()
-    except Exception as e:
-        print(f"Background worker error during training/reloading: {e}")
+async def wait_and_reload(process):
+    await asyncio.to_thread(process.wait)
+    logger.info("Training finished. Reloading model...")
+    if _load_model():
+        logger.info("Triggering post-training batch prediction...")
+        # Fire the prediction in the background
+        asyncio.create_task(perform_batch_prediction())
 
 async def handle_train_db_trigger(connection, pid, channel, payload):
-    print("Database modification noticed on 'train' table. Handing off to background trainer...")
-    
-    # Kicks off the process instantly in the background and frees up the database trigger loop immediately
-    asyncio.create_task(run_training_and_reload())
+
+    logger.info("Training trigger received.")
+    script = os.path.normpath(os.path.join("pipelines", "training_pipeline.py"))
+    try:
+        # Start the process
+        process = subprocess.Popen([sys.executable, script])
+        asyncio.create_task(wait_and_reload(process))
+
+    except Exception as exc:
+        logger.error("Orchestration failed on SQL trigger: %s", exc)
 
 async def handle_predict_db_trigger(connection, pid, channel, payload):
-    current_model = app.state.model if hasattr(app, 'state') and hasattr(app.state, 'model') else _model
-    
-    if current_model is None:
-        print("Prediction aborted: No model is currently loaded inside application memory.")
-        return
-        
-    rows = await connection.fetch('SELECT id, store FROM test WHERE predicted_sales IS NULL')
-    if not rows:
-        return
+    # This just delegates to the shared function
+    await perform_batch_prediction()
 
-    print(f"Batch prediction triggered. Processing {len(rows)} new rows...")
-
-    entity_rows = [{"entity_id": int(row["store"])} for row in rows]
-
-    feature_response = feast_store.get_online_features(
-        features=[
-            "rossmann_features:Store", "rossmann_features:DayOfWeek", "rossmann_features:Promo",
-            "rossmann_features:StateHoliday", "rossmann_features:SchoolHoliday",
-            "rossmann_features:Year", "rossmann_features:Month", "rossmann_features:Day"
-        ],
-        entity_rows=entity_rows
-    ).to_df()
-
-    # Create a copy to safely transform features
-    features_only = feature_response[["Store", "DayOfWeek", "Promo", "StateHoliday", "SchoolHoliday", "Year", "Month", "Day"]].copy()
-    
-    # Map categorical holiday strings back to integers
-    holiday_map = {"0": 0, "a": 1, "b": 2, "c": 3}
-    features_only["StateHoliday"] = (
-        features_only["StateHoliday"].astype(str).str.strip()
-        .map(holiday_map).fillna(0).astype(int)
-    )
-
-    # Coerce everything to int to align with your XGBoost training matrix
-    features_only = features_only.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
-    
-    # Run batch inference
-    predictions = current_model.predict(features_only)
-    
-    update_data = [(float(pred), int(row["id"])) for pred, row in zip(predictions, rows)]
-    
-    await connection.executemany(
-        'UPDATE test SET predicted_sales = $1 WHERE id = $2', 
-        update_data
-    )
-    print(f"Batch prediction successfully written to database for {len(rows)} records.")
-    
 async def run_postgres_event_loop():
     while True:
         try:
             conn = await asyncpg.connect(DB_URL)
             await conn.add_listener('train_changed', handle_train_db_trigger)
             await conn.add_listener('test_inserted', handle_predict_db_trigger)
-            print("Successfully bound persistent notification listeners to PostgreSQL channels.")
-            while True:
-                await asyncio.sleep(5)
+            while True: await asyncio.sleep(5)
         except Exception as err:
-            print(f"Database connection dropped ({err}). Retrying connection loop in 5 seconds...")
+            logger.error(f"DB connection lost: {err}")
             await asyncio.sleep(5)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not _load_model():
-        asyncio.create_task(retry_load_model_on_startup())
-        
-    listener_worker = asyncio.create_task(run_postgres_event_loop())
+    _load_model()
+    asyncio.create_task(run_postgres_event_loop())
     yield
-    listener_worker.cancel()
 
-app = FastAPI(title="Event-Driven Demand Forecast API", lifespan=lifespan)
-app.state.model = _model
+app = FastAPI(title="Sales Forecasting API", lifespan=lifespan)
 
-@app.get("/health")
-def health():
-    current_model = app.state.model if hasattr(app, 'state') and hasattr(app.state, 'model') else _model
-    return {"status": "active", "model_ready": current_model is not None}
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.post("/reload-model", summary="Force a model reload now")
+def reload_model():
+    success = _load_model()
+    if success:
+        return {"status": "Model reloaded successfully.", "model_uri": MODEL_URI}
+    raise HTTPException(
+        status_code=503,
+        detail={"error": "Reload failed.", "reason": "Model loading encountered an error"},
+    )
+
+@app.get("/health", summary="Check API and Model status")
+def health_check():
+    return {"status": "API active", "model_loaded": _model is not None}
 
 @app.get("/", include_in_schema=False)
 def redirect_to_docs():
+    # This automatically sends anyone visiting the main URL straight to the dashboard
     return RedirectResponse(url="/docs")
