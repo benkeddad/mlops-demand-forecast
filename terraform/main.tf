@@ -24,6 +24,9 @@ resource "kubernetes_config_map" "postgres_init" {
   }
 
   data = {
+    # ADDED: Include create-databases.sql so it mounts in the init folder
+    "create-databases.sql" = file("${path.module}/../create-databases.sql")
+    # END OF CHANGE
     "init.sql" = file("${path.module}/../init.sql")
   }
 }
@@ -217,6 +220,12 @@ resource "kubernetes_persistent_volume_claim" "mlflow_data" {
 
 # 2. MLflow Tracking Server Deployment
 resource "kubernetes_deployment" "mlflow" {
+  # CHANGED: Declare explicit dependency on Postgres before attempting configuration
+  depends_on = [
+    kubernetes_deployment.postgres
+  ]
+  # END OF CHANGE
+
   metadata {
     name = "mlflow"
     labels = {
@@ -243,14 +252,18 @@ resource "kubernetes_deployment" "mlflow" {
       spec {
         container {
           name  = "mlflow"
-          image = "ghcr.io/mlflow/mlflow:latest"
+          # CHANGED: Swap original upstream image with custom local driver image
+          image = "rossmann-mlflow:latest"
+          # END OF CHANGE
           image_pull_policy = "IfNotPresent"
           
           args = [
             "mlflow", "server",
             "--host", "0.0.0.0",
             "--port", "5000",
-            "--backend-store-uri", "sqlite:////mlflow/mlflow.db",
+            # CHANGED: Point backend-store-uri to the 'mlflow' database instead of 'rossmann'
+            "--backend-store-uri", "postgresql://user:Password@postgres:5432/mlflow",
+            # END OF CHANGE
             "--default-artifact-root", "/mlflow/artifacts",
             "--allowed-hosts", "*"
           ]
@@ -312,6 +325,12 @@ resource "kubernetes_persistent_volume_claim" "prefect_data" {
 
 # 4. Prefect Orchestration Server Deployment
 resource "kubernetes_deployment" "prefect" {
+  # CHANGED: Declare explicit dependency on Postgres before attempting configuration
+  depends_on = [
+    kubernetes_deployment.postgres
+  ]
+  # END OF CHANGE
+
   metadata {
     name = "prefect"
     labels = {
@@ -338,10 +357,19 @@ resource "kubernetes_deployment" "prefect" {
       spec {
         container {
           name  = "prefect"
-          image = "prefecthq/prefect:2.14-python3.10"
+          # CHANGED: Swap original upstream image with custom local driver image
+          image = "rossmann-prefect:latest"
+          # END OF CHANGE
           image_pull_policy = "IfNotPresent"
           
           args = ["prefect", "server", "start", "--host", "0.0.0.0"]
+
+          env {
+            name  = "PREFECT_API_DATABASE_CONNECTION_URL"
+            # CHANGED: Point the connection URL to the 'prefect' database instead of 'rossmann'
+            value = "postgresql+asyncpg://user:Password@postgres:5432/prefect"
+            # END OF CHANGE
+          }
 
           port {
             container_port = 4200

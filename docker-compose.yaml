@@ -7,6 +7,13 @@ services:
   postgres:
     image: postgres:15-alpine
     container_name: rossmann_postgres
+    # ADDED: Healthcheck to ensure Postgres is actually ready
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d rossmann"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    # END OF CHANGE
     environment:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: Password
@@ -14,8 +21,10 @@ services:
     ports:
       - "5432:5432"
     volumes:
+      - ./create-databases.sql:/docker-entrypoint-initdb.d/create-databases.sql
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
       - postgres_data:/var/lib/postgresql/data
+
     networks:
       - rossmann_network
 
@@ -31,7 +40,11 @@ services:
   # 2. Orchestration & Tracking 
   # ==========================================
   mlflow:
-    image: ghcr.io/mlflow/mlflow:latest
+    # CHANGED: Build local custom image with database driver instead of pulling upstream image
+    build:
+      context: .
+      dockerfile: mlflow.Dockerfile
+    # END OF CHANGE
     container_name: rossmann_mlflow
     ports:
       - "5000:5000"
@@ -41,18 +54,36 @@ services:
       mlflow server
         --host 0.0.0.0
         --port 5000
-        --backend-store-uri sqlite:////mlflow/mlflow.db
+        --backend-store-uri postgresql://user:Password@postgres:5432/mlflow
         --default-artifact-root /mlflow/artifacts
         --allowed-hosts "*"
+    # CHANGED: Require postgres to start first, and restart if connection fails initially
+    depends_on:
+      - postgres
+    restart: on-failure:5
+    # END OF CHANGE
     networks:
       - rossmann_network
 
   prefect:
-    image: prefecthq/prefect:2.14-python3.10
+    # CHANGED: Build local custom image with database driver instead of pulling upstream image
+    build:
+      context: .
+      dockerfile: prefect.Dockerfile
+    # END OF CHANGE
     container_name: rossmann_prefect
     ports:
       - "4200:4200"
+    environment:
+      # Change 'prefect' back to 'rossmann'
+      - PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://user:Password@postgres:5432/prefect
     command: prefect server start --host 0.0.0.0
+    # CHANGED: Require postgres to start first, and restart if connection fails initially
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure:5
+    # END OF CHANGE
     networks:
       - rossmann_network
 
@@ -65,8 +96,8 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - .:/app 
-      - mlflow_data:/mlflow 
+      - .:/app
+      - mlflow_data:/mlflow
     working_dir: /app
     environment:
       - DATABASE_URL=postgresql://user:Password@postgres:5432/rossmann

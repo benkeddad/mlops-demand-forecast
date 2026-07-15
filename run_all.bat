@@ -39,10 +39,11 @@ echo Pulling Postgres...
 wsl -u root k3s ctr -n k8s.io images pull docker.io/library/postgres:15-alpine
 echo Pulling Redis...
 wsl -u root k3s ctr -n k8s.io images pull docker.io/library/redis:7-alpine
-echo Pulling MLflow...
-wsl -u root k3s ctr -n k8s.io images pull docker.io/mlflow/mlflow:latest
-echo Pulling Prefect...
-wsl -u root k3s ctr -n k8s.io images pull docker.io/prefecthq/prefect:2.14-python3.10
+
+:: CHANGED: Stopped pulling upstream MLflow and Prefect images directly into K3s.
+:: We now build custom images locally and import them in the next step instead.
+:: END OF CHANGE
+
 echo Images successfully cached!
 
 echo =======================================================
@@ -65,6 +66,44 @@ if errorlevel 1 (
 wsl -u root bash -c "cd $(wslpath '%CD%') && k3s ctr -n k8s.io images import rossmann-api.tar"
 del rossmann-api.tar
 
+:: CHANGED: Added steps to build, save, and import custom MLflow and Prefect driver-enabled images
+echo Building and importing custom MLflow image...
+call docker build -t rossmann-mlflow:latest -f mlflow.Dockerfile .
+if errorlevel 1 (
+    echo ERROR: mlflow docker build failed. Aborting.
+    pause
+    exit /b 1
+)
+
+call docker save rossmann-mlflow:latest -o rossmann-mlflow.tar
+if errorlevel 1 (
+    echo ERROR: mlflow docker save failed. Aborting.
+    pause
+    exit /b 1
+)
+
+wsl -u root bash -c "cd $(wslpath '%CD%') && k3s ctr -n k8s.io images import rossmann-mlflow.tar"
+del rossmann-mlflow.tar
+
+echo Building and importing custom Prefect image...
+call docker build -t rossmann-prefect:latest -f prefect.Dockerfile .
+if errorlevel 1 (
+    echo ERROR: prefect docker build failed. Aborting.
+    pause
+    exit /b 1
+)
+
+call docker save rossmann-prefect:latest -o rossmann-prefect.tar
+if errorlevel 1 (
+    echo ERROR: prefect docker save failed. Aborting.
+    pause
+    exit /b 1
+)
+
+wsl -u root bash -c "cd $(wslpath '%CD%') && k3s ctr -n k8s.io images import rossmann-prefect.tar"
+del rossmann-prefect.tar
+:: END OF CHANGE
+
 echo =======================================================
 echo   [5/6] Verifying Terraform Natively inside WSL...
 echo =======================================================
@@ -78,7 +117,9 @@ if errorlevel 1 (
 echo =======================================================
 echo   [6/6] Cleaning Old Cluster State & Deploying Natively
 echo =======================================================
-wsl -u root k3s kubectl delete deployment/postgres deployment/redis deployment/mlflow deployment/prefect deployment/rossmann-api service/postgres service/redis service/mlflow service/prefect service/rossmann-api-service pvc/postgres-data-pvc pvc/mlflow-data-pvc pvc/prefect-data-pvc configmap/postgres-init-config --ignore-not-found
+:: CHANGED: Removed the three pvc/* entries from this command so your databases don't get wiped on redeploy.
+wsl -u root k3s kubectl delete deployment/postgres deployment/redis deployment/mlflow deployment/prefect deployment/rossmann-api service/postgres service/redis service/mlflow service/prefect service/rossmann-api-service configmap/postgres-init-config --ignore-not-found
+:: END OF CHANGE
 
 wsl -u root bash -c "cd $(wslpath '%CD%')/terraform && terraform init"
 if errorlevel 1 (
@@ -108,7 +149,7 @@ start "MLflow Tracking Console" wsl -u root bash -c "(while true; do k3s kubectl
 
 start "Prefect Orchestration Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/prefect 4200:4200 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/prefect; sleep 2; done"
 
-start "PostgreSQL Database Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/postgres 5433:5432 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/postgres; sleep 2; done"
+start "PostgreSQL Database Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/postgres 5432:5432 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/postgres; sleep 2; done"
 
 echo.
 echo =======================================================
