@@ -1,7 +1,11 @@
 project: rossmann_project
-registry: data/registry.db
 provider: local
 entity_key_serialization_version: 2
+
+# FEAST CHANGE: Point registry to the SQL database instead of a local file
+registry:
+  registry_type: sql
+  path: postgresql://user:Password@postgres:5432/feast
 
 offline_store:
   type: postgres

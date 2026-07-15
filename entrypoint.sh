@@ -8,6 +8,12 @@ echo "========================================================"
 echo "Waiting 30 seconds for database and cache to initialize..."
 sleep 30
 
+# --- INDUSTRIAL PROVISIONING FIX ---
+# This ensures 'feast' and other databases exist even if volumes are pre-populated
+echo "Bootstrapping required databases..."
+python app/db_bootstrap.py
+# -----------------------------------
+
 echo "Applying Feast definitions..."
 cd feature_repo
 feast apply
