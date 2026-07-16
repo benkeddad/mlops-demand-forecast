@@ -2,12 +2,14 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y git \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# We still copy files here so the image has them even if you don't use volume mounts later
+# Copy application files into the image.
 COPY app/ app/
 COPY pipelines/ pipelines/
 COPY src/ src/
@@ -16,11 +18,11 @@ COPY dvc.yaml .
 COPY feature_repo/ feature_repo/
 COPY data/ data/
 
-# Copy the entrypoint script and grant execution permissions
-# Claude modified this line: entrypoint.sh now lives in docker/, build context is still repo root
-COPY docker/entrypoint.sh .
-RUN chmod +x entrypoint.sh
+# Keep the entrypoint at the same path used by the repository layout.
+# Kubernetes uses the copy stored in the image.
+# Docker Compose provides the same path through the /app bind mount.
 
-# Removed the RUN dvc init from here!
+COPY docker/entrypoint.sh docker/entrypoint.sh
+RUN chmod +x docker/entrypoint.sh
 
 ENTRYPOINT ["./docker/entrypoint.sh"]

@@ -75,6 +75,12 @@ if errorlevel 1 (
 )
 
 wsl -u root bash -c "cd $(wslpath '%CD%') && k3s ctr -n k8s.io images import rossmann-api.tar"
+if errorlevel 1 (
+    echo ERROR: API image import failed. Aborting.
+    pause
+    exit /b 1
+)
+
 del rossmann-api.tar
 
 echo Building and importing custom MLflow image...
@@ -94,6 +100,12 @@ if errorlevel 1 (
 )
 
 wsl -u root bash -c "cd $(wslpath '%CD%') && k3s ctr -n k8s.io images import rossmann-mlflow.tar"
+if errorlevel 1 (
+    echo ERROR: MLflow image import failed. Aborting.
+    pause
+    exit /b 1
+)
+
 del rossmann-mlflow.tar
 
 echo Building and importing custom Prefect image...
@@ -113,6 +125,12 @@ if errorlevel 1 (
 )
 
 wsl -u root bash -c "cd $(wslpath '%CD%') && k3s ctr -n k8s.io images import rossmann-prefect.tar"
+if errorlevel 1 (
+    echo ERROR: Prefect image import failed. Aborting.
+    pause
+    exit /b 1
+)
+
 del rossmann-prefect.tar
 
 echo =======================================================
@@ -127,10 +145,71 @@ if errorlevel 1 (
 )
 
 echo =======================================================
-echo   [6/6] Cleaning Old Cluster State & Deploying Natively
+echo   [6/6] Performing Full Clean Start and Deployment
 echo =======================================================
 
-wsl -u root k3s kubectl delete deployment/postgres deployment/redis deployment/mlflow deployment/prefect deployment/rossmann-api service/postgres service/redis service/mlflow service/prefect service/rossmann-api-service configmap/postgres-init-config --ignore-not-found
+echo Deleting existing application resources and persistent data...
+
+wsl -u root k3s kubectl delete ^
+deployment/postgres ^
+deployment/redis ^
+deployment/mlflow ^
+deployment/prefect ^
+deployment/rossmann-api ^
+service/postgres ^
+service/redis ^
+service/mlflow ^
+service/prefect ^
+service/rossmann-api-service ^
+configmap/postgres-init-config ^
+pvc/postgres-data-pvc ^
+pvc/mlflow-data-pvc ^
+pvc/prefect-data-pvc ^
+--ignore-not-found
+
+if errorlevel 1 (
+    echo ERROR: Kubernetes resource cleanup failed. Aborting.
+    pause
+    exit /b 1
+)
+
+echo Waiting for persistent volume claims to be fully deleted...
+set /a PVC_WAIT_COUNT=0
+
+:wait_pvc_deletion
+wsl -u root bash -c "k3s kubectl get pvc postgres-data-pvc >/dev/null 2>&1 || k3s kubectl get pvc mlflow-data-pvc >/dev/null 2>&1 || k3s kubectl get pvc prefect-data-pvc >/dev/null 2>&1"
+
+if not errorlevel 1 (
+    set /a PVC_WAIT_COUNT+=1
+
+    if !PVC_WAIT_COUNT! GEQ 40 (
+        echo.
+        echo ERROR: Persistent volume claims were not deleted after 2 minutes.
+        pause
+        exit /b 1
+    )
+
+    timeout /t 3 /nobreak >nul
+    goto wait_pvc_deletion
+)
+
+echo Persistent volume claims have been deleted.
+
+echo Removing previous Terraform state...
+
+if exist "deploy\terraform\terraform.tfstate" (
+    del /f /q "deploy\terraform\terraform.tfstate"
+)
+
+if exist "deploy\terraform\terraform.tfstate.backup" (
+    del /f /q "deploy\terraform\terraform.tfstate.backup"
+)
+
+if exist "deploy\terraform\.terraform.tfstate.lock.info" (
+    del /f /q "deploy\terraform\.terraform.tfstate.lock.info"
+)
+
+echo Previous Terraform state removed.
 
 wsl -u root bash -c "cd $(wslpath '%CD%')/deploy/terraform && terraform init"
 if errorlevel 1 (
@@ -138,14 +217,6 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-
-echo Importing preserved PVCs into Terraform state...
-
-wsl -u root bash -c "cd $(wslpath '%CD%')/deploy/terraform && terraform import kubernetes_persistent_volume_claim.postgres_data default/postgres-data-pvc >/dev/null 2>&1 || true"
-
-wsl -u root bash -c "cd $(wslpath '%CD%')/deploy/terraform && terraform import kubernetes_persistent_volume_claim.mlflow_data default/mlflow-data-pvc >/dev/null 2>&1 || true"
-
-wsl -u root bash -c "cd $(wslpath '%CD%')/deploy/terraform && terraform import kubernetes_persistent_volume_claim.prefect_data default/prefect-data-pvc >/dev/null 2>&1 || true"
 
 wsl -u root bash -c "cd $(wslpath '%CD%')/deploy/terraform && terraform apply -auto-approve"
 if errorlevel 1 (
@@ -155,7 +226,18 @@ if errorlevel 1 (
 )
 
 wsl -u root k3s kubectl rollout restart deployment/rossmann-api
+if errorlevel 1 (
+    echo ERROR: API rollout restart failed. Aborting.
+    pause
+    exit /b 1
+)
+
 wsl -u root k3s kubectl rollout status deployment/rossmann-api --timeout=120s
+if errorlevel 1 (
+    echo ERROR: API deployment did not become ready within 120 seconds.
+    pause
+    exit /b 1
+)
 
 echo.
 echo =======================================================
