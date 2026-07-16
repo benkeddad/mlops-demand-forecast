@@ -1,0 +1,22 @@
+project: rossmann_project
+provider: local
+entity_key_serialization_version: 2
+
+# FEAST CHANGE: Point registry to the SQL database instead of a local file
+registry:
+  registry_type: sql
+  path: postgresql://user:Password@postgres:5432/feast
+
+offline_store:
+  type: postgres
+  host: postgres
+  port: 5432
+  database: rossmann
+  db_schema: public
+  user: user
+  password: Password
+  sslmode: disable
+
+online_store:
+  type: redis
+  connection_string: "redis:6379"
