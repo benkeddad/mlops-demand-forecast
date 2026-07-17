@@ -1,43 +1,44 @@
 # MLOps Demand Forecasting Platform — Rossmann Store Sales
 
-[![CI](https://github.com/benkeddad/mlops-demand-forecast/actions/workflows/ci.yml/badge.svg)](https://github.com/benkeddad/mlops-demand-forecast/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.9-blue?logo=python&logoColor=white)
 ![XGBoost](https://img.shields.io/badge/model-XGBoost-006400)
-![MLflow](https://img.shields.io/badge/tracking-MLflow-0194E2)
+![MLflow](https://img.shields.io/badge/tracking%20%2B%20registry-MLflow-0194E2)
 ![Prefect](https://img.shields.io/badge/orchestration-Prefect%202-024DFD)
 ![DVC](https://img.shields.io/badge/data%20versioning-DVC-945DD6)
 ![Feast](https://img.shields.io/badge/feature%20store-Feast-FF5A5F)
+![Evidently](https://img.shields.io/badge/drift%20monitoring-Evidently-FF4B4B)
+![FastAPI](https://img.shields.io/badge/serving-FastAPI-009688?logo=fastapi&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/database-PostgreSQL%2015-4169E1?logo=postgresql&logoColor=white)
+![Redis](https://img.shields.io/badge/online%20store-Redis%207-DC382D?logo=redis&logoColor=white)
+![Docker](https://img.shields.io/badge/containers-Docker-2496ED?logo=docker&logoColor=white)
 ![Kubernetes](https://img.shields.io/badge/orchestration-Kubernetes%20(K3s)-326CE5?logo=kubernetes&logoColor=white)
 ![Terraform](https://img.shields.io/badge/IaC-Terraform-7B42BC?logo=terraform&logoColor=white)
-![Docker](https://img.shields.io/badge/containers-Docker-2496ED?logo=docker&logoColor=white)
+![GitHub Actions](https://img.shields.io/badge/CI-GitHub%20Actions-2088FF?logo=githubactions&logoColor=white)
 
-A closed-loop, event-driven demand forecasting system for Rossmann retail sales, built to demonstrate a **complete, production-shaped MLOps stack** rather than a notebook-to-API demo. Writing a row to Postgres is enough to trigger feature materialization, retraining, model registration, and live model hot-swap — with no cron jobs, no polling, and no manual steps.
+A closed-loop, **event-driven** demand forecasting system for Rossmann retail sales (1,017,209 historical rows across 1,115 stores), built to demonstrate a complete, production-shaped MLOps stack rather than a notebook-to-API demo. Inserting a row into PostgreSQL is enough to trigger feature materialization, retraining, model registration, and a live in-memory model hot-swap — no cron jobs, no polling loops, no manual "now run the pipeline" step.
 
-The system ships with **two independent, fully automated deployment paths**: a Docker Compose stack for local iteration, and a Terraform-provisioned Kubernetes (K3s) deployment for a production-representative environment — both running the exact same five-service architecture.
-
-> This README documents the `terraform_and_k3s_integrated` branch, which layers the Kubernetes/Terraform deployment path on top of the base Docker Compose stack.
+The system ships with **two independent, fully automated deployment paths** — a Docker Compose stack for local iteration, and a Terraform-provisioned Kubernetes (K3s) deployment for a production-representative environment — both running the identical five-service architecture from the same source.
 
 ---
 
 ## Table of Contents
 
 1. [Architecture at a Glance](#architecture-at-a-glance)
-2. [Tech Stack Matrix](#tech-stack-matrix)
+2. [Full MLOps Tech Stack](#full-mlops-tech-stack)
 3. [Repository Structure](#repository-structure)
 4. [Core MLOps Capabilities](#core-mlops-capabilities)
 5. [Deployment Architectures](#deployment-architectures)
 6. [Infrastructure-as-Code Deep Dive](#infrastructure-as-code-deep-dive)
-7. [One-Click Orchestration (`run_all.bat`)](#one-click-orchestration-run_allbat)
+7. [Deployment Automation Scripts](#deployment-automation-scripts)
 8. [Notable Engineering Problems Solved](#notable-engineering-problems-solved)
 9. [Prerequisites & Environment Setup](#prerequisites--environment-setup)
 10. [Quickstart](#quickstart)
 11. [API Reference](#api-reference)
 12. [Configuration Reference](#configuration-reference)
 13. [CI/CD](#cicd)
-14. [Troubleshooting](#troubleshooting)
-15. [Security & Production-Readiness Notes](#security--production-readiness-notes)
-16. [Roadmap](#roadmap)
-17. [About](#about)
+14. [Security & Production-Readiness Notes](#security--production-readiness-notes)
+15. [Roadmap](#roadmap)
+16. [About](#about)
 
 ---
 
@@ -55,7 +56,7 @@ flowchart LR
         PRF[Prefect Server<br/>Rossmann-Enterprise-Pipeline]
     end
 
-    subgraph Pipe["DVC Pipeline"]
+    subgraph Pipe["DVC Pipeline (dvc.yaml)"]
         ING[ingest<br/>src/data.py]
         FEA[featurize<br/>src/features.py]
         TRN[train<br/>src/train.py]
@@ -65,62 +66,70 @@ flowchart LR
     FS{Feast Feature Store}
     API[FastAPI + Uvicorn<br/>rossmann-api]
 
-    PG -- "LISTEN/NOTIFY\ntrain_changed / test_inserted" --> API
-    API -- "subprocess spawn" --> PRF
+    PG -- "LISTEN/NOTIFY<br/>train_changed" --> API
+    PG -- "LISTEN/NOTIFY<br/>test_inserted" --> API
+    API -- "subprocess.Popen<br/>training_pipeline.py" --> PRF
     PRF --> ING
     ING -- "reads train table" --> PG
     FEA -- "feast apply / materialize" --> FS
-    FS -- offline reads --> PG
-    FS -- online writes --> RD
+    FS -- "offline reads (point-in-time)" --> PG
+    FS -- "online writes" --> RD
     TRN -- "log_model + register" --> MLF
-    API -- "pyfunc.load_model(latest)" --> MLF
-    API -- "batch predict, writes back" --> PG
+    API -- "pyfunc.load_model(latest)<br/>on reload" --> MLF
+    API -- "batch predict, writes<br/>predicted_sales back" --> PG
     API -- "GET /predict/realtime" --> FS
-    FS -- online reads --> RD
+    FS -- "online reads (<10ms)" --> RD
 ```
 
-**The core idea:** Postgres is not just a data store here — it doubles as a lightweight event bus via `LISTEN/NOTIFY` triggers, so the whole retrain → register → reload → rescore cycle happens autonomously and is fully observable through MLflow and Prefect.
+**The core idea:** PostgreSQL isn't just a data store here — it doubles as a lightweight event bus via `pg_notify` triggers defined in `db/init.sql`. FastAPI holds a permanent `asyncpg` listener open on two channels (`train_changed`, `test_inserted`), so the whole retrain → register → reload → rescore cycle happens autonomously and is fully observable through the MLflow and Prefect UIs — a real implementation of the "trigger-based retraining" pattern that's usually only discussed in MLOps theory.
 
 ---
 
-## Tech Stack Matrix
+## Full MLOps Tech Stack
 
-| MLOps Discipline | Tool | Role in this project |
-|---|---|---|
-| Data & pipeline versioning | **DVC** (`>=3.50.0`) | Owns caching/reproducibility for the `ingest → featurize → train` stages; each stage is content-hashed and only reruns when its declared deps change |
-| Workflow orchestration | **Prefect 2** (`2.14`, self-hosted server) | Wraps the DVC stages as a tracked, retryable flow (`Rossmann-Enterprise-Pipeline`) with a UI for run history |
-| Feature store (offline + online) | **Feast** (`postgres`, `redis` extras) | Guarantees training/serving feature parity: Postgres as the offline source of truth, Redis as the low-latency online cache, and a dedicated `feast` Postgres database as the SQL registry |
-| Experiment tracking & model registry | **MLflow** (`>=2.10.0`) | Logs params/metrics/lineage per run, and versions the model under a named registry entry the API resolves at load time; metadata backed by a dedicated `mlflow` Postgres database |
-| Model | **XGBoost** (`XGBRegressor`) | Gradient-boosted regression tree ensemble forecasting daily store sales |
-| Model serving | **FastAPI** + **Uvicorn** (async) | Exposes real-time and batch inference, plus operational endpoints, with a non-blocking event loop |
-| Relational storage / event bus | **PostgreSQL 15** | System of record for `train`/`test`, source of `pg_notify` events, and now the shared backend for MLflow, Prefect, and Feast's registry (each in its own database) |
-| Online feature cache | **Redis 7** | Backs Feast's online store for sub-10ms feature lookups |
-| Data drift monitoring | **Evidently** (`>=0.4.0,<0.7.0`) | `DataDriftPreset` over live Postgres data, logged to MLflow as its own experiment, with threshold-based exit codes for automation |
-| Containerization | **Docker** + **Docker Compose** | Three purpose-built images (`docker/`: API, MLflow+psycopg2, Prefect+asyncpg) and a 5-service local dev stack (`deploy/docker-compose.yaml`) |
-| Container orchestration | **Kubernetes (K3s)** | Lightweight, single-binary Kubernetes distribution used as the production-representative runtime |
-| Infrastructure as Code | **Terraform** (`hashicorp/kubernetes` provider, `~>2.24`) | Declaratively provisions every Deployment, Service, PVC, and ConfigMap the stack needs |
-| CI | **GitHub Actions** | Lints (`flake8`) and test-gates every push/PR to `main` |
-| DB access (async) | **asyncpg** | Powers the FastAPI event listener and low-latency batch writes |
-| DB access (sync/ORM) | **SQLAlchemy** + **psycopg2/psycopg** | Used by the DVC-stage scripts and Feast's Postgres offline store |
-| Numerical / data stack | **pandas**, **NumPy**, **scikit-learn**, **PyArrow** | DataFrame transforms, train/val split, and fast Parquet I/O between pipeline stages |
+Every library below is a deliberate choice pulled directly from `requirements.txt`, the three Dockerfiles, and the Terraform provider block — nothing here is decorative.
+
+| Discipline | Tool | Pin (as declared in the repo) | Role in this project |
+|---|---|---|---|
+| **Data & pipeline versioning** | DVC | `>=3.50.0` | Owns caching/reproducibility for the `ingest → featurize → train` stages (`dvc.yaml`); each stage is content-hashed against its declared `deps`/`outs` and only reruns when they actually change |
+| — Windows-compat pins for DVC | `dvc-objects`, `pathspec` | `>=3.0.0`, `>=0.12.0,<1.0.0` | Explicit version floors added after hitting real cross-platform breakage running DVC's cache layer under Windows/WSL2 |
+| **Workflow orchestration** | Prefect 2 (self-hosted server) | `>=2.14.0,<3.0.0` | Wraps the three DVC stages as a tracked, retryable flow (`Rossmann-Enterprise-Pipeline`) with a queryable run-history UI |
+| **Feature store (offline + online)** | Feast | `feast[postgres,redis]` | Guarantees training/serving parity: PostgreSQL as the point-in-time-correct offline source, Redis as the sub-10ms online cache, and a dedicated `feast` Postgres database as the **SQL registry** (not a flat file) |
+| **Experiment tracking & model registry** | MLflow | `>=2.10.0` | Logs params/metrics/dataset lineage per run and versions the trained model under a named Model Registry entry that the API resolves by URI at load/reload time |
+| **Model** | XGBoost (`XGBRegressor`) | `>=1.7.0` | Gradient-boosted regression tree ensemble forecasting daily per-store sales (`objective="reg:squarederror"`) |
+| **Model serving** | FastAPI + Uvicorn | `>=0.100.0` / `>=0.22.0` | Async, non-blocking web layer exposing real-time inference, forced reloads, and health checks; runs an `asyncio` background task alongside the request loop |
+| **Data validation / typing** | Pydantic | `>=2.0.0` | Backs FastAPI's request/response models |
+| **Data drift monitoring** | Evidently | `>=0.4.0,<0.7.0` | `DataDriftPreset` run over live Postgres data (`monitoring/drift.py`), logged to MLflow as its own experiment, with a `--fail-on-drift` exit code for automation |
+| **Relational storage / event bus** | PostgreSQL 15 (`alpine`) | image `postgres:15-alpine` | System of record for `train`/`test`; source of `pg_notify` events; shared backend for its own data **plus** MLflow's, Prefect's, and Feast's metadata (one database each, one Postgres instance) |
+| **Online feature cache** | Redis 7 (`alpine`) | image `redis:7-alpine` | Backs Feast's online store for millisecond-latency feature lookups at inference time |
+| **Containerization** | Docker + Docker Compose | — | Three purpose-built images (`docker/`) and a 5-service local dev stack (`deploy/docker-compose.yaml`) |
+| **Container orchestration** | Kubernetes (K3s) | — | Lightweight, single-binary Kubernetes distribution used as the production-representative runtime, run natively inside WSL2 |
+| **Infrastructure as Code** | Terraform | `hashicorp/kubernetes ~> 2.24.0`, core `>= 1.0.0` | Declaratively provisions every `Deployment`, `Service`, `PersistentVolumeClaim`, and `ConfigMap` the stack needs (`deploy/terraform/main.tf`) |
+| **CI** | GitHub Actions | — | Lints (`flake8`) and test-gates every push/PR to `main` |
+| **DB access — async** | `asyncpg` | `==0.29.0` | Powers FastAPI's `LISTEN/NOTIFY` event loop and low-latency batch writes; also the driver Prefect's server uses internally against its own database |
+| **DB access — sync, autocommit-required** | `psycopg2-binary` | `==2.9.0` | Used where `CREATE DATABASE` has to run outside a transaction block (`app/db_bootstrap.py`); also the driver MLflow's server uses internally |
+| **DB access — sync, pooled** | `psycopg[binary,pool]` | unpinned | Feast's PostgreSQL offline store driver |
+| **DB access — ORM / DataFrame I/O** | SQLAlchemy | `==2.0.0` | `create_engine` + `pd.read_sql` / `df.to_sql` used everywhere a pipeline script needs to move a whole table in or out of Postgres (`src/data.py`, `src/seed_db.py`, `src/predict_initial.py`, `monitoring/drift.py`) |
+| **Numerical / data stack** | pandas, NumPy, scikit-learn, PyArrow, openpyxl | `>=2.0.0` / `>=1.24.0` / `>=1.2.0` / `>=14.0.0` / `>=3.1.0` | DataFrame transforms, `train_test_split`, fast Parquet I/O between DVC stages, Excel compatibility |
+| **Dev ergonomics** | `watchdog` | `>=3.0.0` | Backs Uvicorn's `--reload`; `WATCHFILES_FORCE_POLLING=true` is set because file-change events don't cross the Docker Desktop ↔ WSL2 volume boundary reliably otherwise |
+
+**Why three different PostgreSQL client libraries instead of one?** Each has a genuinely different job: `asyncpg` is the only one of the three that supports async `LISTEN/NOTIFY`, which the event-driven API loop depends on; `psycopg2` is used specifically where a connection must run in `AUTOCOMMIT` mode to issue `CREATE DATABASE` (which PostgreSQL refuses to allow inside a transaction); and SQLAlchemy's `create_engine` is what `pandas.read_sql` / `.to_sql` expect under the hood for whole-table I/O. Using the "one ORM to rule them all" approach here would have meant fighting the tool instead of using it.
 
 ---
 
 ## Repository Structure
 
-The layout groups files by *concern* rather than leaving deployment scripts, Dockerfiles, and SQL loose at the repo root:
-
 ```
 mlops-demand-forecast/
 ├── app/
-│   ├── main.py                # FastAPI app: lifespan hooks, event listeners, inference routes
-│   └── db_bootstrap.py        # Idempotent "ensure these databases exist" check, run on every boot
+│   ├── main.py                # FastAPI app: lifespan hook, LISTEN/NOTIFY loop, inference routes
+│   └── db_bootstrap.py        # Idempotent "ensure these 4 databases exist" check, run on every boot
 ├── src/
 │   ├── data.py                 # DVC "ingest" stage — pulls `train` table from Postgres → parquet
 │   ├── features.py             # DVC "featurize" stage — builds features, applies + materializes Feast
 │   ├── model.py                 # XGBRegressor factory
 │   ├── train.py                 # DVC "train" stage — trains, evaluates, logs + registers to MLflow
-│   ├── evaluate.py              # RMSPE metric (zero-sales masked)
+│   ├── evaluate.py              # RMSPE metric (zero-sales days masked out)
 │   ├── predict_initial.py       # One-shot batch scoring pass run at container bootstrap
 │   └── seed_db.py               # Idempotent CSV → Postgres loader for train/test tables
 ├── pipelines/
@@ -130,30 +139,31 @@ mlops-demand-forecast/
 │   ├── features.py              # Entity + FeatureView + PostgreSQLSource definitions
 │   └── materialize.py           # Standalone wide-window materialization utility
 ├── monitoring/
-│   ├── drift.py                  # Postgres-driven drift monitor, logs to MLflow (see below)
-│   └── reports/                  # Timestamped HTML drift reports (gitignored, generated at runtime)
-├── docker/                       # Everything needed to build container images
-│   ├── api.Dockerfile             # The FastAPI + pipeline image
-│   ├── mlflow.Dockerfile          # Upstream MLflow image + psycopg2 (Postgres backend driver)
-│   ├── prefect.Dockerfile         # Upstream Prefect image + asyncpg (Postgres backend driver)
+│   ├── drift.py                  # Postgres-driven drift monitor, logs to MLflow
+│   └── reports/                  # Timestamped HTML drift reports (generated at runtime)
+├── docker/
+│   ├── api.Dockerfile             # FastAPI + full pipeline image (python:3.9-slim base)
+│   ├── mlflow.Dockerfile          # Upstream MLflow image + psycopg2-binary
+│   ├── prefect.Dockerfile         # Upstream Prefect 2.14 image + asyncpg
 │   └── entrypoint.sh               # Container bootstrap sequence (see below)
-├── db/                            # Postgres schema & bootstrap SQL
+├── db/
 │   ├── init.sql                    # train/test schema + LISTEN/NOTIFY trigger definitions
-│   └── create-databases.sql        # CREATE DATABASE mlflow / prefect / feast (first-boot only, see below)
-├── deploy/                        # Everything needed to stand the stack up
+│   └── create-databases.sql        # First-boot-only CREATE DATABASE for mlflow / prefect / feast
+├── deploy/
 │   ├── docker-compose.yaml         # Local 5-service stack definition
 │   └── terraform/
-│       └── main.tf                  # Full K8s resource graph: Postgres/Redis/MLflow/Prefect/API
-├── scripts/                       # Orchestration & setup scripts
-│   ├── run_all.bat                  # One-click WSL2 → K3s → Terraform deployment
-│   ├── dockerize.bat                # Rebuild/restart helper for the Compose path
-│   └── install_terraform.sh          # Idempotent Terraform installer for the WSL Ubuntu shell
+│       ├── main.tf                  # Full K8s resource graph
+│       └── k3s.yaml                 # Generated kubeconfig (copied out of WSL2 at deploy time)
+├── scripts/
+│   ├── deploy_k3s_clean.bat          # Full destructive rebuild: WSL2 → K3s → images → Terraform
+│   ├── deploy_k3s_reconcile.bat      # Non-destructive: only touches unhealthy/missing resources
+│   ├── deploy_compose_clean.bat      # Full rebuild of the Docker Compose stack, no cache
+│   ├── scriptsdeploy_compose_reconcile.bat  # `docker-compose up -d` reconciliation, no rebuild
+│   └── install_terraform.sh          # Idempotent Terraform installer for the WSL2 Ubuntu shell
 ├── .github/workflows/ci.yml        # Lint + test GitHub Actions workflow
-├── dvc.yaml                        # DVC stage graph (ingest → featurize → train) — stays at root (DVC convention)
-└── requirements.txt                 # Full Python dependency set — stays at root (pip/Docker COPY convention)
+├── dvc.yaml                        # DVC stage graph (ingest → featurize → train)
+└── requirements.txt                 # Full Python dependency set
 ```
-
-`data/`, `dvc.yaml`, `requirements.txt`, `.dockerignore`, `.dvcignore`, `.gitattributes`, and `README.md` stay at the repo root deliberately — DVC, pip, and Docker's build context all expect them there by convention, and moving them would trade "less clutter" for "extra flags on every command."
 
 ---
 
@@ -170,7 +180,7 @@ stages:
   train:       python src/train.py       # deps: train_features.parquet → registered MLflow model
 ```
 
-Each stage is only re-executed when its declared dependencies actually change, giving the pipeline reproducible, cache-aware reruns instead of "just run everything every time." DVC is deliberately kept in charge of *what* needs to rerun, while Prefect (below) is kept in charge of *when* and *how it's observed*.
+Each stage only re-executes when its declared dependencies actually change — reproducible, cache-aware reruns instead of "just run everything every time." DVC is deliberately kept in charge of *what* needs to rerun, while Prefect is kept in charge of *when* it runs and *how it's observed*.
 
 ### 2. Workflow Orchestration — Prefect
 
@@ -179,14 +189,12 @@ Each stage is only re-executed when its declared dependencies actually change, g
 ```python
 @flow(name="Rossmann-Enterprise-Pipeline")
 def ml_training_pipeline():
-    dvc_ingest()     # @task, retries=1
-    dvc_featurize()  # @task
-    dvc_train()      # @task
+    dvc_ingest()     # @task, retries=1, "dvc repro --force ingest"
+    dvc_featurize()  # @task, "dvc repro featurize"
+    dvc_train()      # @task, "dvc repro train"
 ```
 
-This intentionally layers Prefect *on top of* DVC rather than replacing it: DVC gives content-hash caching and stage-level reproducibility; Prefect gives retries, run history, and a queryable UI (`http://localhost:4200`) for every pipeline execution — a common production pattern for teams that want orchestration observability without giving up file-level pipeline caching.
-
-Like MLflow, the Prefect server persists its own flow-run history in a dedicated `prefect` Postgres database (`PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://.../prefect`) instead of the default local SQLite file, and needs `asyncpg` added on top of the upstream `prefecthq/prefect` image to talk to it — handled by `docker/prefect.Dockerfile`.
+This layers Prefect *on top of* DVC rather than replacing it: DVC gives content-hash caching and stage-level reproducibility; Prefect gives retries, run history, and a queryable UI (`http://localhost:4200`) for every execution — a common production pattern for teams that want orchestration observability without giving up file-level pipeline caching. The Prefect server persists its own flow-run history in a dedicated `prefect` Postgres database rather than the default local SQLite file.
 
 ### 3. Feature Store — Feast (Offline/Online Parity)
 
@@ -208,144 +216,132 @@ rossmann_source = PostgreSQLSource(
 )
 ```
 
-- **Offline store:** Postgres — used for point-in-time-correct historical feature retrieval during training.
-- **Online store:** Redis — used for millisecond-latency feature lookups at inference time.
-- **Registry:** a dedicated `feast` Postgres database (`registry_type: sql`), not a local `.db` file — so the feature/entity definitions Feast resolves are consistent no matter which container or pod asks, instead of depending on a file baked into (or bind-mounted onto) one specific instance.
-- **TTL:** 3650 days — set deliberately wide because the Rossmann dataset's historical range (2013–2015) would otherwise fall outside Feast's default lookback window (see [Notable Engineering Problems Solved](#notable-engineering-problems-solved)).
+- **Offline store:** PostgreSQL — point-in-time-correct historical feature retrieval for training.
+- **Online store:** Redis — millisecond-latency lookups at inference time.
+- **Registry:** a dedicated `feast` Postgres database (`registry_type: sql`), not a local `.db` file, so feature/entity definitions resolve consistently no matter which container or pod asks.
+- **TTL:** 3650 days — deliberately wide, because the Rossmann dataset's historical range (2013–2015) would otherwise fall outside Feast's default lookback window (see [Notable Engineering Problems Solved](#notable-engineering-problems-solved)).
 
-This is the textbook feature-store guarantee: the *same* feature definitions and transformation logic serve both the training pipeline and the real-time API, eliminating training/serving skew.
+This is the textbook feature-store guarantee: the *same* feature-engineering logic (`src/features.py::build_features`) serves both the training pipeline and the real-time API, eliminating training/serving skew — and `monitoring/drift.py` deliberately reuses that same function again for drift comparisons, so drift is measured against the model's real input schema rather than a re-implementation that could quietly diverge.
 
 ### 4. Experiment Tracking & Model Registry — MLflow
 
 `src/train.py` logs a fully lineage-tracked run for every training pass:
 
 ```python
+mlflow.set_experiment("Rossmann_Sales_Forecasting")
 with mlflow.start_run():
     dataset = mlflow.data.from_pandas(processed_df, source=processed_data_path)
-    mlflow.log_input(dataset, context="training")           # dataset lineage
+    mlflow.log_input(dataset, context="training")          # exact data lineage, not just a metric
 
     model = get_model(n_estimators=150, max_depth=8)
     model.fit(X_train, y_train)
 
     mlflow.log_param("model_type", "XGBRegressor")
-    mlflow.log_metric("val_rmspe", calculate_rmspe(y_val.values, model.predict(X_val)))
+    mlflow.log_metric("val_rmspe", rmspe_score)
 
     mlflow.xgboost.log_model(
         xgb_model=model,
         artifact_path="xgboost_model",
-        registered_model_name="Rossmann_XGBoost_Model",   # → MLflow Model Registry
+        registered_model_name="Rossmann_XGBoost_Model",   # → Model Registry, not just the artifact store
     )
 ```
 
-Every run captures **parameters, metrics, and the exact dataset used** (via `mlflow.log_input`), and every successful run is pushed straight into the **Model Registry** rather than just the tracking store — so `models:/Rossmann_XGBoost_Model/latest` always resolves to the newest trained version without any manual "promote to production" step.
+The API resolves the model with `MODEL_URI = "models:/Rossmann_XGBoost_Model/latest"` — a live Model Registry pointer, not a hardcoded run ID — so a fresh registration is picked up automatically on the next reload without redeploying the API.
 
-MLflow's own tracking/registry metadata is backed by a dedicated `mlflow` Postgres database (`--backend-store-uri postgresql://.../mlflow`), not the default local SQLite file — so run history survives container replacement, not just container restarts. This requires `psycopg2` inside the MLflow container, which the upstream `ghcr.io/mlflow/mlflow` image doesn't ship; `docker/mlflow.Dockerfile` layers it on top (see [Notable Engineering Problems Solved](#notable-engineering-problems-solved)). Model *artifacts* (the actual serialized model files) still live on a PVC-backed volume, not in Postgres — `--default-artifact-root` is unrelated to `--backend-store-uri` and intentionally stays file-based.
+### 5. Model — XGBoost
 
-### 5. Model — XGBoost Regression
+`src/model.py` is a small, explicit factory rather than inline hyperparameters scattered through the training script:
 
-`src/model.py` wraps `xgboost.XGBRegressor` (`objective='reg:squarederror'`). Training uses `n_estimators=150, max_depth=8`; evaluation uses **RMSPE** (Root Mean Square Percentage Error) — the actual metric used in the original Kaggle Rossmann competition — computed in `src/evaluate.py` with zero-sales days masked out to avoid division-by-zero distortion.
+```python
+xgb.XGBRegressor(
+    objective="reg:squarederror",
+    learning_rate=0.1, max_depth=6, n_estimators=100,   # defaults; train.py overrides to 150/8
+    random_state=42,
+)
+```
 
-### 6. Model Serving — FastAPI with Dual Inference Paths
+Evaluated with **RMSPE** (Root Mean Square Percentage Error, `src/evaluate.py`) — the standard metric for the Rossmann competition — with zero-sales days explicitly masked out of the denominator to avoid division-by-zero distortion.
 
-`app/main.py` exposes **two distinct inference paths**, deliberately modeling the two inference patterns almost every production forecasting system needs:
+### 6. Model Serving — FastAPI with Two Distinct Inference Paths
 
-| Path | Endpoint | Feature source | Use case |
-|---|---|---|---|
-| **Batch** | internal (`perform_batch_prediction`, triggered by DB events or `/reload-model`) | Direct Postgres query + local `build_features()` | Scoring large backlogs of `test` rows; bypasses Feast's temporal materialization window entirely, since freshly inserted rows may not be materialized yet |
-| **Real-time** | `GET /predict/realtime/{store_id}` | Feast **online store** (Redis) | Single-entity, sub-10ms feature retrieval + live inference — the pattern used for request-time serving |
+`app/main.py` exposes **real-time single-entity inference** and an **event-triggered batch path**, deliberately kept separate because they hit different storage layers:
 
-The batch path strictly re-orders and type-casts columns (`["Store","DayOfWeek","Promo","StateHoliday","SchoolHoliday","Year","Month","Day"]`) to guarantee the exact schema the model was trained on — a deliberate defense against silent feature-order mismatches, a classic source of "the model always predicts the same value" bugs.
+- **Real-time (`GET /predict/realtime/{store_id}`):** looks up the latest feature snapshot for one store from **Redis via Feast** (`feast_store.get_online_features`, run in a thread since Feast's SDK is synchronous), then runs inference immediately. Response includes the retrieved feature vector for transparency.
+- **Batch (`perform_batch_prediction`, triggered by the `test_inserted` DB event or right after retraining finishes):** pulls every row from `test` where `predicted_sales IS NULL` via `asyncpg`, reconstructs features locally with the exact same `build_features` function used in training, and bulk-writes predictions back with `executemany`.
+
+Both paths independently enforce the same defensive column ordering before calling `.predict()`:
+
+```python
+feature_cols = ["Store", "DayOfWeek", "Promo", "StateHoliday", "SchoolHoliday", "Year", "Month", "Day"]
+features_only = processed_df[feature_cols].copy()
+```
+
+and the batch path goes one step further — it checks whether an entire batch produced a single repeated prediction value and logs a warning if so, a targeted defense against a bug class (feature-order drift) that otherwise fails silently instead of throwing.
 
 ### 7. Event-Driven Closed Loop — PostgreSQL `LISTEN`/`NOTIFY`
 
-Instead of polling or a cron-scheduled retrain job, `db/init.sql` installs two trigger functions:
+This is the architectural centerpiece. `db/init.sql` defines two triggers:
 
 ```sql
--- Fires on ANY change to the train table
-CREATE TRIGGER train_alter_trig
-AFTER INSERT OR UPDATE OR DELETE ON train
-FOR EACH STATEMENT EXECUTE FUNCTION notify_train_change();   -- pg_notify('train_changed', ...)
+CREATE TRIGGER train_alter_trig AFTER INSERT OR UPDATE OR DELETE ON train
+FOR EACH STATEMENT EXECUTE FUNCTION notify_train_change();   -- pg_notify('train_changed', 'update')
 
--- Fires on every new row inserted into test
-CREATE TRIGGER test_insert_trig
-AFTER INSERT ON test
-FOR EACH ROW EXECUTE FUNCTION notify_test_insert();           -- pg_notify('test_inserted', NEW.id)
+CREATE TRIGGER test_insert_trig AFTER INSERT ON test
+FOR EACH ROW EXECUTE FUNCTION notify_test_insert();           -- pg_notify('test_inserted', NEW.id::text)
 ```
 
-FastAPI's `lifespan` hook opens a persistent `asyncpg` connection and registers listeners for both channels:
+FastAPI's lifespan hook opens a permanent `asyncpg` listener on both channels (`app/main.py::run_postgres_event_loop`, auto-reconnecting on connection loss):
 
-```mermaid
-sequenceDiagram
-    participant U as Data Producer
-    participant PG as PostgreSQL
-    participant API as FastAPI listener
-    participant PRF as Prefect flow (subprocess)
-    participant MLF as MLflow Registry
-
-    U->>PG: INSERT / UPDATE train rows
-    PG-->>API: NOTIFY train_changed
-    API->>PRF: spawn training_pipeline.py
-    PRF->>PRF: dvc repro ingest → featurize → train
-    PRF->>MLF: log_model + register (Rossmann_XGBoost_Model)
-    PRF-->>API: subprocess exit
-    API->>MLF: pyfunc.load_model(latest)  (hot-swap, no restart)
-    API->>PG: batch predict outstanding test rows
-    U->>PG: INSERT new test rows
-    PG-->>API: NOTIFY test_inserted
-    API->>PG: batch predict immediately
+```python
+await conn.add_listener('train_changed', handle_train_db_trigger)
+await conn.add_listener('test_inserted', handle_predict_db_trigger)
 ```
 
-The result: dropping new labeled data into Postgres autonomously triggers retraining, registry promotion, in-process model hot-swap, and rescoring — a genuine closed loop, not a manually re-triggered demo pipeline. A `POST /reload-model` endpoint is also exposed as a manual escape hatch.
+- A write to `train` → `handle_train_db_trigger` spawns `pipelines/training_pipeline.py` as a subprocess → once it exits, `wait_and_reload` reloads the MLflow model in-process and fires a background batch-prediction pass.
+- A write to `test` → `handle_predict_db_trigger` calls the exact same `perform_batch_prediction` function directly.
+
+No polling, no scheduler, no manual "please retrain now" step — the database itself is the trigger.
 
 ### 8. Data Drift Monitoring — Evidently
 
-`monitoring/drift.py` compares the population the current model was **trained on** (`train`) against the population it's **currently scoring** (`test`), reusing the *exact* training-time transform (`src.features.build_features`) so the comparison never silently drifts out of sync with the model's real input schema:
+`monitoring/drift.py` is a full CLI tool, not a notebook cell:
 
-```bash
-python monitoring/drift.py                                   # train vs. test, default 50% drift threshold
-python monitoring/drift.py --drift-share-threshold 0.3 --fail-on-drift   # for cron/CI wiring
+```
+python monitoring/drift.py --drift-share-threshold 0.3 --fail-on-drift
 ```
 
-Each run:
+- Loads the `train` (reference) and `test` (current) populations from Postgres, running both through the **same** `build_features` transform used in training.
+- Runs Evidently's `DataDriftPreset` over the shared model-input columns.
+- Saves a timestamped HTML report (`monitoring/reports/`, never overwritten).
+- Logs `drift_share`, `n_drifted_columns`, and `dataset_drift` as an MLflow run in its own `data-drift-monitoring` experiment — so drift history is queryable in the same tracking server as training runs, over time.
+- Exits non-zero when drift crosses `--drift-share-threshold`, making it a valid automated retraining trigger for a cron job, a CI step, or a Prefect deployment — nothing currently schedules it (see [Roadmap](#roadmap)), but the automation contract is already built.
 
-- pulls both populations straight from Postgres via SQLAlchemy (`DATABASE_URL`, same pattern as `src/data.py`) instead of reading static CSVs, so it reflects the live system rather than a frozen snapshot;
-- runs Evidently's `DataDriftPreset` over the shared model-input columns (`FEATURE_COLUMNS` from `src/features.py`) and writes a **timestamped** HTML report to `monitoring/reports/` (never overwritten, gitignored);
-- logs `drift_share`, `n_drifted_columns`, and `dataset_drift` as an MLflow run under the `data-drift-monitoring` experiment, with the HTML report attached as an artifact — so drift history is queryable in the same tracking server as training runs, not scattered across local files;
-- exits non-zero when `--fail-on-drift` is set and drift crosses the threshold, so it drops cleanly into a cron job, a CI step, or a scheduled Prefect deployment as an automated retraining trigger (see [Roadmap](#roadmap)).
+`requirements.txt` deliberately pins `evidently>=0.4.0,<0.7.0`, with an inline comment explaining why: `drift.py` parses `report.as_dict()["metrics"][0]["result"]`, and Evidently's 0.7 rewrite changed that schema — an easy silent-breakage trap that's headed off with an explicit upper bound instead of discovering it in production.
 
-`requirements.txt` pins `evidently<0.7.0` deliberately: the script parses `report.as_dict()["metrics"][0]["result"]`, a schema Evidently changed in its 0.7 rewrite, so leaving the upper bound open would let a routine `pip install` silently break this script months later.
+### 9. Idempotent Multi-Database Bootstrap
+
+Four logical databases live on one PostgreSQL instance: `rossmann` (app data), `mlflow`, `prefect`, `feast`. `db/create-databases.sql` creates three of them via Postgres's `docker-entrypoint-initdb.d` convention — but that mechanism **only ever runs once**, against a completely empty data directory. `app/db_bootstrap.py` exists specifically to cover the case that convention doesn't: it connects to the system `postgres` database with `psycopg2` in `AUTOCOMMIT` mode, checks `pg_catalog.pg_database` for all four expected databases, and creates any that are missing — and it runs on **every** API container start, not just first boot, so a redeploy against an existing volume with newly-added requirements never crashes with "database does not exist."
 
 ---
 
 ## Deployment Architectures
 
-The project ships **two parallel, fully-scripted deployment paths** targeting the same five services (`postgres`, `redis`, `mlflow`, `prefect`, `rossmann-api`):
+### Path A — Docker Compose (local development)
 
-| | **Docker Compose** | **Kubernetes (K3s) via Terraform** |
-|---|---|---|
-| Entry point | `scripts\dockerize.bat` → `docker-compose -f deploy/docker-compose.yaml up -d --build` | `scripts\run_all.bat` → `terraform apply` |
-| Networking | Single bridge network (`rossmann_network`) | K8s `LoadBalancer` Services per component |
-| Persistence | Named Docker volumes (`postgres_data`, `mlflow_data`) | `PersistentVolumeClaim`s provisioned by K3s' local-path provisioner |
-| Config injection | `environment:` block per service | `env {}` blocks + a `ConfigMap` for `db/init.sql` + `db/create-databases.sql` |
-| Best for | Fast local iteration, debugging | Demonstrating production-representative container orchestration |
+`deploy/docker-compose.yaml` defines five services on a shared bridge network (`rossmann_network`): `postgres` (with a real `pg_isready` healthcheck), `redis`, `mlflow` and `prefect` (both **built locally** from custom Dockerfiles rather than pulled from upstream — see below), and `api`. The `mlflow` and `prefect` services use `depends_on: condition: service_healthy` against Postgres and `restart: on-failure:5`, so they don't crash-loop against a database that hasn't finished starting yet. The `api` service bind-mounts the entire repo root (`..:/app`) for live hot-reload during development, with `WATCHFILES_FORCE_POLLING=true` set because filesystem-change events don't reliably cross the Docker Desktop ↔ WSL2 volume boundary otherwise.
 
-### Docker Compose (local development)
+### Path B — Kubernetes via Terraform (K3s on WSL2)
 
-`deploy/docker-compose.yaml` defines five services on one bridge network. The `api`, `mlflow`, and `prefect` services all build local images (`docker/api.Dockerfile`, `docker/mlflow.Dockerfile`, `docker/prefect.Dockerfile`) rather than pulling upstream ones — the latter two exist purely to add the Postgres driver (`psycopg2`/`asyncpg`) the stock images lack. The `api` service mounts the live source tree for hot-reload (`WATCHFILES_FORCE_POLLING=true` — needed because filesystem-change events don't propagate reliably across the Docker Desktop/WSL2 volume boundary), and both `mlflow` and `prefect` are gated on `postgres`'s healthcheck (`condition: service_healthy`) rather than just "container started," since both now have a hard runtime dependency on Postgres being ready to accept connections.
-
-### Kubernetes via Terraform (production-representative)
-
-The same five services are re-expressed as native Kubernetes objects in `deploy/terraform/main.tf` and applied against a local K3s cluster. See the deep dive below.
+The same five-service topology, re-expressed as native Kubernetes resources and provisioned declaratively instead of imperatively. K3s runs natively inside WSL2 (not inside Docker Desktop's own VM), and Terraform talks to it directly via a kubeconfig extracted from `/etc/rancher/k3s/k3s.yaml`. This path is described in full in the next section.
 
 ---
 
 ## Infrastructure-as-Code Deep Dive
 
-`deploy/terraform/main.tf` uses the `hashicorp/kubernetes` provider (`~>2.24.0`) pointed at a kubeconfig extracted at deploy time (`deploy/terraform/k3s.yaml`), and provisions:
+`deploy/terraform/main.tf` (Terraform `>= 1.0.0`, `hashicorp/kubernetes ~> 2.24.0`) declares:
 
-- **`kubernetes_config_map.postgres_init`** — embeds both `db/init.sql` (schema + trigger functions) and `db/create-databases.sql` (`CREATE DATABASE mlflow / prefect / feast`) as cluster config, mounted into Postgres at `/docker-entrypoint-initdb.d`. Postgres only runs these on a **completely empty** data directory, which is a real gap on re-deploys against an existing PVC — see the `db_bootstrap.py` entry in [Notable Engineering Problems Solved](#notable-engineering-problems-solved) for how that's covered defensively too.
-- **Three `PersistentVolumeClaim`s** (Postgres 2Gi, MLflow 2Gi, Prefect 1Gi), each with `wait_until_bound = false` — a deliberate workaround for a K3s local-path-provisioner deadlock where Terraform would otherwise block forever waiting for a PVC to bind before the pod that triggers the bind is even scheduled.
-- **Four backing-service `Deployment` + `LoadBalancer Service` pairs** (Postgres, Redis, MLflow, Prefect), each with `image_pull_policy = "IfNotPresent"` so pre-pulled/pre-imported images are reused instead of re-fetched. MLflow and Prefect both run **custom-built images** (`rossmann-mlflow:latest`, `rossmann-prefect:latest`), not the stock upstream ones — see below.
+- **Three `PersistentVolumeClaim`s** (Postgres 2Gi, MLflow 2Gi, Prefect 1Gi), each with `wait_until_bound = false` — a deliberate fix for a K3s-specific deadlock (see below).
+- **Four backing-service `Deployment` + `LoadBalancer Service` pairs** (Postgres, Redis, MLflow, Prefect), each with `image_pull_policy = "IfNotPresent"` so pre-imported images are reused instead of re-fetched. MLflow and Prefect run **custom-built images** (`rossmann-mlflow:latest`, `rossmann-prefect:latest`), not the stock upstream ones.
 - **The `rossmann-api` `Deployment`**, which explicitly declares `depends_on` all four backing services so Terraform's apply order mirrors the application's real runtime dependency graph, and mounts the **same MLflow PVC** the MLflow server itself uses — letting the API read freshly registered model artifacts directly off disk without needing an S3-compatible artifact store.
 - **A `LoadBalancer Service`** exposing the API on port `8000`.
 
@@ -362,34 +358,38 @@ resource "kubernetes_persistent_volume_claim" "postgres_data" {
 
 ---
 
-## One-Click Orchestration (`run_all.bat`)
+## Deployment Automation Scripts
 
-The Kubernetes path is driven end-to-end by a single Windows batch script (`scripts\run_all.bat`, self-locating via `cd /d "%~dp0.."` so it always operates from the repo root regardless of where it's launched from), structured as six explicit, fail-fast stages:
+The Kubernetes path ships **two** deployment scripts with different risk profiles, plus a matched pair for Docker Compose — not one "just run this" script:
 
-1. **Reset WSL & start K3s** — `wsl --shutdown` clears any ghost volume locks from a previous run, then a fresh K3s server is launched natively inside WSL (`k3s server --bind-address=127.0.0.1`), with a bounded polling loop (`kubectl get nodes`, 40 × 3s retries) waiting for the Kubernetes API to come online.
-2. **Extract Terraform credentials** — copies the live `/etc/rancher/k3s/k3s.yaml` kubeconfig out of the WSL filesystem into `deploy\terraform\k3s.yaml` so the Terraform provider can authenticate.
-3. **Pre-load base images into K3s' containerd cache** — `k3s ctr -n k8s.io images pull` for the stock Postgres/Redis images. This bypasses the Docker daemon entirely: **K3s uses containerd, not Docker, as its runtime**, so images have to be pulled directly into containerd's own image namespace. MLflow and Prefect are deliberately *not* pulled here anymore — they're custom-built in the next step instead.
-4. **Build and import three custom images** — `docker build` + `docker save` + `k3s ctr -n k8s.io images import` for `rossmann-api` (`docker\api.Dockerfile`), `rossmann-mlflow` (`docker\mlflow.Dockerfile`), and `rossmann-prefect` (`docker\prefect.Dockerfile`). The latter two exist purely to layer `psycopg2`/`asyncpg` onto the stock MLflow/Prefect images, which don't ship a Postgres driver (see [Notable Engineering Problems Solved](#notable-engineering-problems-solved)). Each build/save/import is individually error-checked so a failure in any one image aborts the run immediately rather than deploying a partial stack.
-5. **Verify/install Terraform** — delegates to `scripts\install_terraform.sh` (see below), then tears down any previous cluster state (`kubectl delete ... --ignore-not-found`, deliberately **excluding** the PVCs so redeploys don't wipe Postgres) so re-runs are idempotent, before running `terraform init` and `terraform apply -auto-approve` against `deploy\terraform`.
-6. **Roll out and expose** — `kubectl rollout restart` + `rollout status` on the API deployment, then opens four separate terminal windows, each running a self-healing `port-forward` loop piped into `kubectl logs -f`, for the API, MLflow, Prefect, and Postgres — giving live logs and local access (`localhost:8000`, `:5000`, `:4200`, `:5432`) simultaneously.
+| Script | Behavior |
+|---|---|
+| `scripts\deploy_k3s_clean.bat` | **Destructive, six-stage full rebuild.** `wsl --shutdown` to clear ghost volume locks → starts a fresh K3s server natively in WSL2, polling `kubectl get nodes` (40 × 3s retries) → extracts the kubeconfig for Terraform → pre-pulls stock Postgres/Redis images directly into containerd's `k8s.io` namespace → builds **and imports** all three custom images (`docker build` → `docker save` → `k3s ctr images import`, each individually error-checked) → verifies/installs Terraform → deletes all previous K8s resources **including PVCs** → `terraform init && terraform apply -auto-approve` → rolls out the API and opens four live log/port-forward windows. Use this for a first deploy or a truly clean slate. |
+| `scripts\deploy_k3s_reconcile.bat` | **Non-destructive recovery/redeploy.** Checks whether K3s is already running via `systemctl is-active`; starts it only if needed. Individually checks every ConfigMap, PVC, Service, and Deployment the stack needs — runs `terraform apply` only if something is actually missing. For each of the five Deployments, checks `kubectl rollout status` with a short timeout and only issues a `rollout restart` if it's unhealthy. **Never deletes PVCs, state, or existing deployments.** Use this for "I already deployed once and just want it running again." |
+| `scripts\deploy_compose_clean.bat` | Full Compose teardown (`down --volumes --rmi all --remove-orphans`), no-cache rebuild of every image, then `up -d --force-recreate`. |
+| `scripts\scriptsdeploy_compose_reconcile.bat` | Validates the Compose file (`config --quiet`) then `up -d` — starts anything missing/stopped, leaves healthy containers and volumes untouched. |
+| `scripts\install_terraform.sh` | Idempotent Terraform installer for the WSL2 Ubuntu shell — checks for an existing binary, installs `unzip` if needed (with a fix for a corrupted apt source baked in), then downloads and installs the Terraform `1.9.0` Linux binary directly rather than going through HashiCorp's apt repository. Invoked automatically by both K3s deploy scripts. |
+
+Every K3s-path script runs from the Windows side and drives WSL2 via `wsl -u root ...` — nothing has to be manually typed inside the Ubuntu terminal once these scripts exist.
 
 ---
 
 ## Notable Engineering Problems Solved
 
-These are the non-obvious issues actually hit and fixed while building this stack — the kind of detail that separates "it works on my machine" from a system someone has actually operated:
+The kind of detail that separates "it works on my machine" from a system someone has actually operated:
 
 - **K3s runs on containerd, not Docker.** A `docker build` alone doesn't make an image visible to K3s. Fixed by explicitly exporting with `docker save` and importing into containerd's own `k8s.io` namespace via `k3s ctr images import`.
-- **`cmd.exe` delayed expansion corrupts embedded bash.** Passing bash logic containing `!` characters inline through `wsl bash -c "..."` from a batch script with `setlocal enabledelayedexpansion` silently truncates everything after the `!`. Fixed by extracting the fragile logic into a standalone `install_terraform.sh` invoked from WSL, rather than inlining it in the `.bat` file.
-- **A corrupted HashiCorp apt source blocked all package installs.** A stale/malformed `/etc/apt/sources.list.d/hashicorp.list` caused `apt-get update` to fail outright inside the WSL Ubuntu shell. Fixed by force-removing the file before re-adding the correct signed repository entry.
+- **`cmd.exe` delayed expansion corrupts embedded bash.** Passing bash logic containing `!` characters inline through `wsl bash -c "..."` from a batch script with `setlocal enabledelayedexpansion` silently truncates everything after the `!`. Fixed by extracting the fragile logic into a standalone `install_terraform.sh` invoked from WSL2, rather than inlining it in the `.bat` file.
+- **A corrupted HashiCorp apt source blocked all package installs.** A stale/malformed `/etc/apt/sources.list.d/hashicorp.list` caused `apt-get update` to fail outright inside the WSL2 Ubuntu shell — even for installing `unzip`, which has nothing to do with HashiCorp. Fixed by force-removing the file before continuing.
 - **K3s' local-path PVC provisioner can deadlock under Terraform.** By default, Terraform waits for a `PersistentVolumeClaim` to reach `Bound` before proceeding — but K3s' provisioner only binds a volume once a pod that *uses* the claim is scheduled, which never happens if Terraform is still blocked on the PVC. Fixed with `wait_until_bound = false` on every PVC resource.
-- **Feast silently materialized zero rows.** `feast materialize-incremental` uses a recent default lookback window, but the Rossmann dataset's timestamps (2013–2015) fell entirely outside it — so materialization "succeeded" with an empty Redis store and no error. Fixed by switching to explicit-range `feast materialize <start> <end>` spanning 2010–2030.
-- **MLflow defaulted to a loopback-only bind address.** `mlflow server` binds to `127.0.0.1` unless told otherwise, making it unreachable from any other container or pod. Fixed with an explicit `--host 0.0.0.0`.
+- **Feast silently materialized zero rows.** `feast materialize-incremental` uses a recent default lookback window, but the Rossmann dataset's timestamps (2013–2015) fell entirely outside it — so materialization "succeeded" with an empty Redis store and no error. Fixed by switching to explicit-range `feast materialize 2010-01-01T00:00:00 2030-12-31T23:59:59`.
+- **MLflow defaults to a loopback-only bind address.** `mlflow server` binds to `127.0.0.1` unless told otherwise, making it unreachable from any other container or pod. Fixed with an explicit `--host 0.0.0.0`.
 - **`localhost` doesn't resolve across container/pod boundaries.** `feature_store.yaml` and the API's default connection strings originally pointed at `localhost`; fixed by switching to Docker Compose/Kubernetes service DNS names (`postgres`, `redis`, `mlflow`, `prefect`).
-- **Column-casing mismatch between Postgres and the trained schema.** Postgres columns are lowercase (`stateholiday`, `dayofweek`); the model was trained on PascalCase feature names (`StateHoliday`, `DayOfWeek`). Fixed with an explicit rename map applied consistently at every ingestion, training, and inference boundary — including inside the real-time Feast path.
+- **Column-casing mismatch between Postgres and the trained schema.** Postgres columns are lowercase (`stateholiday`, `dayofweek`); the model was trained on PascalCase feature names (`StateHoliday`, `DayOfWeek`). Fixed with an explicit rename map applied consistently at every ingestion, training, and inference boundary — including the real-time Feast path.
 - **Feature-order mismatches silently produce constant predictions.** The batch prediction path explicitly slices and re-orders columns into the exact training-time feature order before calling `.predict()`, and logs a warning if a batch produces a single repeated prediction value — a targeted defense against a bug class that fails silently rather than throwing.
-- **The official MLflow and Prefect images don't ship a Postgres driver.** Pointing `mlflow server --backend-store-uri postgresql://...` or Prefect's `PREFECT_API_DATABASE_CONNECTION_URL` at Postgres crashes immediately with a missing-module error (`psycopg2` / `asyncpg` respectively) — neither upstream image bundles them. Fixed with two tiny custom images (`docker/mlflow.Dockerfile`, `docker/prefect.Dockerfile`) that just add the one missing driver package on top of the official base.
-- **`docker-entrypoint-initdb.d` scripts only run once, ever.** Postgres only executes `db/create-databases.sql` (which creates the `mlflow`/`prefect`/`feast` databases) on a **completely empty** data directory — so on any redeploy against an existing PVC, newly-added `CREATE DATABASE` statements silently never run, and dependent services fail with "database does not exist." Fixed with `app/db_bootstrap.py`, an idempotent check-then-create step (plain `psycopg2`, connects to the `postgres` system database, checks `pg_catalog.pg_database` before creating each one) that runs on **every** API container start, not just first-boot.
+- **The official MLflow and Prefect images don't ship a PostgreSQL driver.** Pointing `mlflow server --backend-store-uri postgresql://...` or Prefect's `PREFECT_API_DATABASE_CONNECTION_URL` at Postgres crashes immediately with a missing-module error (`psycopg2` / `asyncpg` respectively) — neither upstream image bundles them. Fixed with two tiny custom images (`docker/mlflow.Dockerfile`, `docker/prefect.Dockerfile`) that just add the one missing driver on top of the official base.
+- **`docker-entrypoint-initdb.d` scripts only run once, ever.** Postgres only executes `db/create-databases.sql` on a **completely empty** data directory — so on any redeploy against an existing volume, newly-added `CREATE DATABASE` statements silently never run, and dependent services fail with "database does not exist." Fixed with `app/db_bootstrap.py`, an idempotent check-then-create step that runs on **every** API container start.
+- **A silent Evidently schema break, headed off before it happened.** `monitoring/drift.py` parses Evidently's report output at a specific dict path (`report.as_dict()["metrics"][0]["result"]`). Evidently's 0.7 release restructured that schema. Rather than discover this the hard way, `requirements.txt` pins `evidently>=0.4.0,<0.7.0` with an inline comment explaining exactly why the ceiling is there.
 
 ---
 
@@ -438,7 +438,9 @@ sudo apt-get install -y python3 python3-pip python3-venv build-essential
 curl -sfL https://get.k3s.io | sh -
 ```
 
-**Terraform:**
+**Terraform** — two valid routes:
+
+*Option A: the standard cross-distro HashiCorp apt repository, done by hand:*
 
 ```bash
 sudo apt-get install -y gnupg software-properties-common curl
@@ -447,7 +449,9 @@ echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://
 sudo apt-get update && sudo apt-get install terraform
 ```
 
-> The repository also ships `scripts/install_terraform.sh`, which performs an idempotent version of this same install (with the corrupted-apt-source fix baked in) and is run automatically by `scripts\run_all.bat`.
+*Option B (what this repo actually automates): let `scripts\install_terraform.sh` handle it.* It does **not** use the apt-repository route above — it downloads the Terraform `1.9.0` Linux binary directly from `releases.hashicorp.com`, unzips it into `/usr/local/bin/`, and is idempotent (skips the whole thing if `terraform` is already on `PATH`). It also carries the corrupted-apt-source fix baked in, since it needs `unzip` installed first. This script runs automatically as part of both `scripts\deploy_k3s_clean.bat` and `scripts\deploy_k3s_reconcile.bat`, so in practice you can skip Option A entirely and just run one of those two scripts.
+
+> **Reference Python version:** the API image (`docker/api.Dockerfile`) and CI both pin **Python 3.9**. Match that locally if you're running anything outside a container to avoid subtle dependency-resolution differences.
 
 ---
 
@@ -461,10 +465,14 @@ cd mlops-demand-forecast
 docker compose -f deploy/docker-compose.yaml up -d --build
 ```
 
-Or use the bundled helper, which tears down old containers/volumes first:
+Or use the bundled helpers:
 
 ```bat
-scripts\dockerize.bat
+:: First run / full rebuild (destroys existing containers, volumes, and images first)
+scripts\deploy_compose_clean.bat
+
+:: Subsequent runs — starts what's missing, leaves healthy containers/volumes alone
+scripts\scriptsdeploy_compose_reconcile.bat
 ```
 
 Once containers are healthy: API docs at `http://localhost:8000/docs`, MLflow at `http://localhost:5000`, Prefect at `http://localhost:4200`, Postgres at `localhost:5432`.
@@ -474,9 +482,11 @@ Once containers are healthy: API docs at `http://localhost:8000/docs`, MLflow at
 After completing [Prerequisites](#prerequisites--environment-setup):
 
 1. Ensure **Docker Desktop is running**.
-2. Right-click `scripts\run_all.bat` → **Run as Administrator** (elevated privileges are required to manage WSL instances, the Docker daemon, and storage mounts).
+2. Right-click the appropriate script → **Run as Administrator** (elevated privileges are required to manage WSL2 instances, the Docker daemon, and storage mounts):
+   - **First deploy, or want a guaranteed clean slate:** `scripts\deploy_k3s_clean.bat`
+   - **Already deployed once, just restarting/recovering:** `scripts\deploy_k3s_reconcile.bat`
 
-The script runs all six stages described in [One-Click Orchestration](#one-click-orchestration-run_allbat) unattended and finishes by opening live log/port-forward windows for every service.
+Either script finishes by opening four live log/port-forward windows — one each for the API, MLflow, Prefect, and Postgres.
 
 ---
 
@@ -487,7 +497,7 @@ The script runs all six stages described in [One-Click Orchestration](#one-click
 | `GET` | `/` | Redirects to the interactive Swagger UI (`/docs`) |
 | `GET` | `/health` | Liveness + model-loaded status check |
 | `POST` | `/reload-model` | Forces an immediate reload of the latest registered MLflow model |
-| `GET` | `/predict/realtime/{store_id}` | Real-time single-store prediction via the Feast/Redis online store (<10ms feature retrieval) |
+| `GET` | `/predict/realtime/{store_id}` | Real-time single-store prediction via the Feast/Redis online store |
 
 ```bash
 # Health check
@@ -510,7 +520,7 @@ Environment variables consumed by the API and pipeline scripts (defaults shown a
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` | `postgresql://user:Password@postgres:5432/rossmann` | Postgres connection string (both `asyncpg` and SQLAlchemy paths) |
+| `DATABASE_URL` | `postgresql://user:Password@postgres:5432/rossmann` | Postgres connection string (both the `asyncpg` and SQLAlchemy paths) |
 | `MODEL_URI` | `models:/Rossmann_XGBoost_Model/latest` | MLflow Model Registry URI resolved at load/reload time |
 | `MLFLOW_TRACKING_URI` | `http://mlflow:5000` | MLflow tracking + registry endpoint |
 | `PREFECT_API_URL` | `http://prefect:4200/api` | Prefect server API endpoint used by the orchestration flow |
@@ -529,26 +539,15 @@ Environment variables consumed by the API and pipeline scripts (defaults shown a
 
 ---
 
-## Troubleshooting
-
-- **"K3s did not come up after 2 minutes"** — Increase the RAM allocated to WSL2 by creating a `.wslconfig` file in your Windows user profile folder.
-- **"Docker build failed"** — Confirm `docker/api.Dockerfile` (or `docker/mlflow.Dockerfile` / `docker/prefect.Dockerfile`, depending on which step failed) exists and is syntactically valid.
-- **"Terraform command not found" inside the script** — Re-run Step 3 of the [Prerequisites](#prerequisites--environment-setup), then restart the Ubuntu terminal.
-- **Permission denied errors** — `run_all.bat` must be run as Administrator; it manages WSL instances, the Docker daemon, and storage mounts.
-- **Feast returns 404 / empty features for a real-time prediction** — the online store hasn't been materialized yet; re-run `feast materialize-incremental` (or the wide-range `feast materialize` used in this repo) from `feature_repo/`.
-- **MLflow/Prefect crash-loop with "database ... does not exist"** — usually means you're redeploying against an old Postgres volume created before the `mlflow`/`prefect`/`feast` databases existed. `app/db_bootstrap.py` runs on every API container start and creates any missing database, but it runs from the API container specifically — give the stack a minute to stabilize, or manually run `python app/db_bootstrap.py` once against the same `DATABASE_URL`.
-
----
-
 ## Security & Production-Readiness Notes
 
-Some deliberate shortcuts were made to keep this a clear, runnable local/portfolio demo — flagged here explicitly rather than left implicit:
+Deliberate shortcuts made to keep this a clear, runnable local/portfolio demo — flagged here explicitly rather than left implicit:
 
 - Postgres credentials (`user` / `Password`) are hardcoded in plaintext in `deploy/docker-compose.yaml` and `deploy/terraform/main.tf` instead of being injected via Docker secrets or a Kubernetes `Secret`.
 - All Kubernetes `Service` objects use `type: LoadBalancer`, which on a single-node K3s cluster simply exposes a NodePort-equivalent — there's no ingress controller, TLS termination, or authentication in front of any service.
-- MLflow, Prefect, and Feast's registry all now persist to dedicated Postgres databases rather than local SQLite/files — a real improvement over one shared database — but they're still all databases on the **same single Postgres instance**, so one Postgres outage still takes down data, tracking, orchestration, and feature metadata together. MLflow model *artifacts* also still live on a single PVC-backed volume rather than an object store (S3/GCS), which won't horizontally scale past one node.
+- MLflow, Prefect, and Feast's registry all persist to dedicated Postgres databases rather than local SQLite/files — a real improvement over one shared database — but they're still all databases on the **same single Postgres instance**, so one Postgres outage takes down data, tracking, orchestration, and feature metadata together. MLflow model *artifacts* also still live on a single PVC-backed volume rather than an object store (S3/GCS), which won't horizontally scale past one node.
 - The Prefect flow is triggered as an ad-hoc `subprocess` from the API process rather than as a scheduled/deployed Prefect flow run — fine for a single-node demo, but not how you'd want to trigger training in a multi-replica deployment.
-- `monitoring/drift.py` supports `--fail-on-drift` for exactly this reason, but nothing currently calls it on a schedule — it has to be run by hand today (see [Roadmap](#roadmap)).
+- `monitoring/drift.py` supports `--fail-on-drift` for exactly this reason, but nothing currently calls it on a schedule — it has to be run by hand today.
 
 ---
 
@@ -559,7 +558,7 @@ Some deliberate shortcuts were made to keep this a clear, runnable local/portfol
 - [ ] Replace plaintext Postgres credentials with Kubernetes `Secret`s
 - [ ] Convert the ad-hoc Prefect `subprocess` trigger into a proper scheduled/deployed Prefect flow run
 - [ ] Add an Ingress + TLS in front of the Kubernetes services instead of raw `LoadBalancer` exposure
-- [x] ~~Wire `monitoring/drift.py` into a scheduled job against live inference logs, rather than a manually-invoked script~~ — `drift.py` now reads live Postgres data, logs to MLflow, and supports `--fail-on-drift` for automation; it just isn't *scheduled* anywhere yet
+- [x] ~~Wire `monitoring/drift.py` into a scheduled job against live inference logs~~ — `drift.py` now reads live Postgres data, logs to MLflow, and supports `--fail-on-drift`; it just isn't *scheduled* anywhere yet
 - [ ] Actually schedule `monitoring/drift.py` — a cron entry, a GitHub Actions job, or (most consistent with the rest of the stack) its own Prefect deployment that calls `--fail-on-drift` and triggers `pipelines/training_pipeline.py` on failure
 
 ---
