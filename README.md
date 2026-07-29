@@ -15,7 +15,7 @@
 ![Terraform](https://img.shields.io/badge/IaC-Terraform-7B42BC?logo=terraform&logoColor=white)
 ![GitHub Actions](https://img.shields.io/badge/CI-GitHub%20Actions-2088FF?logo=githubactions&logoColor=white)
 
-Feed this system one new row of sales data and step back. A database trigger fires. A training pipeline spins up in a subprocess. Three DVC stages run in sequence — ingest, featurize, train. A new XGBoost model gets logged to MLflow with full data lineage and registered under a named model. The FastAPI process reloads that model into memory. Every row in the `test` table still waiting on a prediction gets scored and written back to Postgres. All of it happens inside a couple of minutes, all of it is visible in the Prefect and MLflow dashboards, and none of it required a scheduler, a cron job, or a human typing a command.
+Feed this system one new row of sales data and step back. A database trigger fires. A training pipeline spins up as a real Prefect deployment run. Three DVC stages run in sequence — ingest, featurize, train. A new XGBoost model gets logged to MLflow with full data lineage and registered under a named model. The FastAPI process reloads that model into memory. Every row in the `test` table still waiting on a prediction gets scored and written back to Postgres. All of it happens inside a couple of minutes, all of it is visible in the Prefect and MLflow dashboards, and none of it required a scheduler, a cron job, or a human typing a command.
 
 That closed loop — not the individual tools — is the point of this repository: a demonstration that a Rossmann-style sales forecasting model can live inside a system that retrains, re-registers, and redeploys itself in response to its own data, using the same patterns a production ML platform team would reach for.
 
@@ -85,7 +85,7 @@ flowchart TB
     MODEL -->|prediction JSON| ROUTES
 
     PGAPP -->|"pg_notify('train_changed')<br/>pg_notify('test_inserted')"| LISTEN
-    LISTEN -->|subprocess.Popen| PRF
+    LISTEN -->|"run_deployment()"| PRF
     PRF ==>|"persists every flow run<br/>and task run it executes"| PGPRF
     PRF --> DVC
     DVC -->|"SELECT * FROM train"| PGAPP
@@ -94,7 +94,7 @@ flowchart TB
     FS -->|writes online features| RD
     DVC -->|log_model + register| MLF
     MLF ==>|"persists params, metrics, dataset<br/>lineage & registry entries"| PGMLF
-    LISTEN -->|reload on subprocess exit| MLF
+    LISTEN -->|reload on flow run completion| MLF
     MLF -->|pyfunc.load_model| MODEL
     MODEL -->|"UPDATE test SET predicted_sales"| PGAPP
 ```
@@ -112,7 +112,7 @@ Every entry below traces to something real in the repo — a line in `requiremen
 |---|---|
 | PostgreSQL 15 (`postgres:15-alpine`) | System of record for `train`/`test`; also hosts three more logical databases (`mlflow`, `prefect`, `feast`) on the same instance; source of the `pg_notify` events that drive the whole loop |
 | Redis 7 (`redis:7-alpine`) | Feast's online store — the sub-10ms feature cache the real-time endpoint reads from |
-| DVC `>=3.50.0` (+ `dvc-objects`, `pathspec` version floors added for Windows compatibility) | Content-hashes the `ingest → featurize → train` stage graph so nothing reruns unless its actual inputs changed |
+| DVC `[s3]>=3.50.0` (+ `dvc-objects`, `pathspec` version floors added for Windows compatibility) | Content-hashes the `ingest → featurize → train` stage graph so nothing reruns unless its actual inputs changed; the `[s3]` extra plus `.dvc/config`'s `storage` remote let `dvc push`/`dvc pull` share cached artifacts with a team instead of staying local-disk-only |
 
 **Feature & ML Layer**
 | Tool | What it's doing here |
@@ -143,10 +143,10 @@ Every entry below traces to something real in the repo — a line in `requiremen
 **Infrastructure Layer**
 | Tool | What it's doing here |
 |---|---|
-| Docker + Docker Compose | Three purpose-built images and a 5-service local stack |
+| Docker + Docker Compose | Three purpose-built images and a 5-service local stack, with credentials sourced from a gitignored `deploy/.env` |
 | Kubernetes (K3s) | Single-binary Kubernetes distribution run natively inside WSL2 |
-| Terraform (`hashicorp/kubernetes ~> 2.24.0`) | Declares every `Deployment`, `Service`, `PersistentVolumeClaim`, and `ConfigMap` the stack needs |
-| GitHub Actions | Lints and test-gates every push/PR to `main` |
+| Terraform (`hashicorp/kubernetes ~> 2.24.0`, `hashicorp/tls ~> 4.0`) | Declares every `Deployment`, `Service`, `PersistentVolumeClaim`, `ConfigMap`, `Secret`, and `Ingress` the stack needs |
+| GitHub Actions | `ci.yml` lints and test-gates every push/PR to `main`; `drift-monitoring.yml` runs `monitoring/drift.py` on a daily schedule |
 
 **Database Access Layer — three drivers, three different jobs**
 
@@ -190,7 +190,7 @@ sequenceDiagram
 
     Note over PG: INSERT / UPDATE / DELETE on train
     PG->>API: pg_notify('train_changed', 'update')
-    API->>PRF: subprocess.Popen(training_pipeline.py)
+    API->>PRF: run_deployment("Rossmann-Enterprise-Pipeline/production")
     activate PRF
     PRF->>PRFDB: create flow run (Rossmann-Enterprise-Pipeline)
     PRF->>DVC: dvc repro --force ingest
@@ -208,7 +208,7 @@ sequenceDiagram
     PRF->>PRFDB: log task run: train = Completed
     PRF->>PRFDB: mark flow run = Completed
     deactivate PRF
-    PRF-->>API: subprocess process exits
+    PRF-->>API: flow run reaches a terminal state (polled via read_flow_run)
     API->>MLF: pyfunc.load_model(models:/.../latest)
     MLF->>MLFDB: SELECT latest registry version
     MLF-->>API: model artifact
@@ -218,10 +218,11 @@ sequenceDiagram
 A few details worth calling out:
 
 - The trigger is a Postgres **statement-level** trigger (`FOR EACH STATEMENT`), not row-level — one notification per write operation regardless of how many rows it touched, which keeps a bulk `seed_db.py` load from firing hundreds of thousands of retrains.
-- `handle_train_db_trigger` doesn't `await` the subprocess directly on the main event loop — it hands the wait off to `asyncio.to_thread(process.wait)` inside `wait_and_reload`, so a multi-minute training run doesn't block the API from serving other requests.
+- `handle_train_db_trigger` doesn't block the main event loop waiting for training to finish — `trigger_training_run()` calls `run_deployment(..., timeout=0)`, which returns the new flow run's id immediately, then hands the actual wait off to `wait_and_reload_deployment_run()` as a separate background task that polls the Prefect API every few seconds, so a multi-minute training run doesn't block the API from serving other requests.
 - The `ingest` stage runs with `dvc repro --force`, deliberately bypassing DVC's cache check — because the actual change happened inside the Postgres table, which DVC has no visibility into, so "nothing changed on disk" would otherwise cause DVC to (correctly, but unhelpfully) skip the stage.
 - The moment training finishes, the API doesn't just reload the model — it immediately fires a fresh batch-prediction pass in the background, so any rows sitting in `test` get scored against the model that was *just* registered, not the stale one from before.
 - Notice `PRFDB` and `MLFDB` are drawn as separate participants but are the exact same Postgres server as `PG` under the hood — Prefect's flow/task-run bookkeeping and MLflow's run/registry bookkeeping are both durable database writes, not in-memory state that a container restart would wipe out.
+- `run_deployment("Rossmann-Enterprise-Pipeline/production")` targets a real Prefect Deployment, not the flow function directly — it's registered once at API startup by a second long-lived subprocess (`pipelines/serve_deployment.py`, launched from `app/main.py`'s `lifespan`) calling `flow.serve(name="production")`. The same deployment is reachable from `POST /trigger-training` for manual/automated triggers outside the DB-write path (see [API Surface](#api-surface)), and can optionally be put on a cron schedule via `TRAINING_SCHEDULE_CRON` on top of the DB trigger.
 
 ---
 
@@ -330,11 +331,13 @@ Both paths converge on the same five services — `postgres`, `redis`, `mlflow`,
 
 ## Infrastructure as Code
 
-`deploy/terraform/main.tf` (Terraform `>= 1.0.0`, provider `hashicorp/kubernetes ~> 2.24.0`) declares the full resource graph declaratively:
+`deploy/terraform/main.tf` (Terraform `>= 1.0.0`, providers `hashicorp/kubernetes ~> 2.24.0` and `hashicorp/tls ~> 4.0`) declares the full resource graph declaratively:
 
 - **Three `PersistentVolumeClaim`s** — Postgres (2Gi), MLflow (2Gi), Prefect (1Gi) — each set with `wait_until_bound = false`, a deliberate fix for a K3s-specific provisioner deadlock (details in [Hard-Won Lessons](#hard-won-lessons)).
 - **Four backing `Deployment` + `LoadBalancer Service` pairs** for Postgres, Redis, MLflow, and Prefect, all with `image_pull_policy = "IfNotPresent"` so images pre-imported into containerd are reused rather than re-fetched.
 - **The `rossmann-api` `Deployment`**, which declares an explicit `depends_on` against all four backing services and mounts the *same* MLflow `PersistentVolumeClaim` the MLflow server itself writes to — letting the API read freshly registered model artifacts straight off the shared volume without needing an S3-compatible artifact store.
+- **A `kubernetes_secret` (`postgres-credentials`)** holding the raw Postgres user/password/db plus three pre-composed connection strings (`API_DATABASE_URL`, `MLFLOW_BACKEND_STORE_URI`, `PREFECT_DB_URL`) — every Deployment above reads its credentials via `secret_key_ref` instead of a literal `value`. MLflow's connection string lives inside a CLI arg rather than a discrete env var, so it's threaded through with Kubernetes' native `$(VAR_NAME)` command-substitution syntax instead.
+- **A self-signed TLS certificate (`hashicorp/tls` provider) + `kubernetes_ingress_v1`** fronting the API, MLflow, and Prefect UIs as name-based virtual hosts (`api.rossmann.local`, `mlflow.rossmann.local`, `prefect.rossmann.local`) through K3s' built-in Traefik ingress controller — added alongside the existing `LoadBalancer` Services, not instead of them, so nothing that already worked stops working.
 
 ```hcl
 resource "kubernetes_persistent_volume_claim" "postgres_data" {
@@ -351,16 +354,22 @@ resource "kubernetes_persistent_volume_claim" "postgres_data" {
 
 ## The Automation Scripts
 
-Four deployment scripts, not one — because "tear everything down and rebuild" and "just get me back to a running state" are genuinely different operations with different risk profiles:
+Eight deployment scripts, not four — because "tear everything down and rebuild" vs. "just get me back to a running state" are genuinely different operations with different risk profiles, **and** each of those two operations exists in two Docker-engine flavors: driven from Docker Desktop's Windows-side CLI, or driven from a Docker Engine installed natively inside the WSL2 Ubuntu distro (the `_wsl`-suffixed scripts). Same Kubernetes/Compose end state either way — only *where the `docker build`/`docker save` steps actually run* changes.
 
-| Script | What it does |
-|---|---|
-| `scripts\deploy_k3s_clean.bat` | Destructive full rebuild. Resets WSL2, starts a fresh K3s server, pre-pulls base images into containerd, builds and imports all three custom images, deletes every prior K8s resource **including PVCs**, then runs `terraform init && terraform apply`. Use for a first deploy or a genuinely clean slate. |
-| `scripts\deploy_k3s_reconcile.bat` | Non-destructive recovery. Checks whether K3s is already running before starting it. Individually checks every ConfigMap, PVC, Service, and Deployment the stack needs, and only runs `terraform apply` if something's actually missing. Restarts only the Deployments that fail a `rollout status` check. Never touches PVCs or existing state. |
-| `scripts\deploy_compose_clean.bat` | Full Compose teardown (`down --volumes --rmi all --remove-orphans`) followed by a no-cache rebuild and `up -d --force-recreate`. |
-| `scripts\scriptsdeploy_compose_reconcile.bat` | Validates the Compose file, then `up -d` — starts anything missing or stopped, leaves everything healthy alone. |
+| Script | Docker engine used | What it does |
+|---|---|---|
+| `scripts\deploy_k3s_clean.bat` | Docker Desktop (Windows-side CLI) | Destructive full rebuild. Resets WSL2, starts a fresh K3s server, pre-pulls base images into containerd, builds and imports all three custom images, deletes every prior K8s resource **including PVCs**, then runs `terraform init && terraform apply`. Use for a first deploy or a genuinely clean slate. |
+| `scripts\deploy_k3s_clean_wsl.bat` | Docker Engine installed natively inside WSL2 Ubuntu | Identical rebuild logic to the script above, except every `docker build`/`docker save` runs via `wsl bash -c "docker ..."` against Ubuntu's own Docker Engine instead of Docker Desktop's — faster, since the build context and image layers never cross the Windows↔WSL2 filesystem boundary. Starts the WSL Docker daemon automatically if it isn't already running, and fails with a clear error if Docker was never installed inside WSL at all. |
+| `scripts\deploy_k3s_reconcile.bat` | Docker Desktop (Windows-side CLI) | Non-destructive recovery. Checks whether K3s is already running before starting it. Individually checks every ConfigMap, PVC, Service, and Deployment the stack needs, and only runs `terraform apply` if something's actually missing. Restarts only the Deployments that fail a `rollout status` check. Never touches PVCs or existing state. |
+| `scripts\deploy_k3s_reconcile_wsl.bat` | Docker Engine installed natively inside WSL2 Ubuntu | Same non-destructive reconciliation as the script above; also verifies the WSL Docker daemon is up first, for consistency with the rest of the WSL-Docker script set (this particular script otherwise only talks to `k3s`/`kubectl` and Terraform directly, not `docker`). |
+| `scripts\deploy_compose_clean.bat` | Docker Desktop (Windows-side CLI) | Full Compose teardown (`down --volumes --rmi all --remove-orphans`) followed by a no-cache rebuild and `up -d --force-recreate`. |
+| `scripts\deploy_compose_clean_wsl.bat` | Docker Engine installed natively inside WSL2 Ubuntu | Same full teardown/rebuild, with every `docker compose` command run inside WSL2 against Ubuntu's own Docker Engine. Must be run **as Administrator** — it needs elevated rights to map the ports Compose opens inside WSL back to Windows `localhost`. |
+| `scripts\deploy_compose_reconcile.bat` | Docker Desktop (Windows-side CLI) | Validates the Compose file, then `up -d` — starts anything missing or stopped, leaves everything healthy alone. |
+| `scripts\deploy_compose_reconcile_wsl.bat` | Docker Engine installed natively inside WSL2 Ubuntu | Same validate-then-`up -d` reconciliation, run inside WSL2 against Ubuntu's own Docker Engine. Also requires **Administrator**, for the same localhost port-mapping reason as its clean counterpart. |
 
-Both K3s scripts also invoke `scripts\install_terraform.sh` automatically — a standalone shell script rather than inline batch-file logic, for a reason explained in [Hard-Won Lessons](#hard-won-lessons).
+Both K3s scripts, in either Docker flavor, also invoke `scripts\install_terraform.sh` automatically — a standalone shell script rather than inline batch-file logic, for a reason explained in [Hard-Won Lessons](#hard-won-lessons).
+
+**Docker Desktop is required even if you only ever run the `_wsl` scripts.** K3s itself, and the plain (non-`_wsl`) scripts, still depend on it being installed with WSL Integration enabled; the `_wsl` variants just point the *build* steps at a second, independently-installed Docker Engine running inside Ubuntu for speed. Whichever engine actually built or is running a container, **Docker Desktop's own dashboard (Containers / Images tabs) can still be used to inspect and monitor it**, as long as WSL Integration stays enabled for that distro — you don't lose visibility by building through WSL instead of Docker Desktop.
 
 ---
 
@@ -369,7 +378,7 @@ Both K3s scripts also invoke `scripts\install_terraform.sh` automatically — a 
 ```
 mlops-demand-forecast/
 ├── app/
-│   ├── main.py                # FastAPI app: LISTEN/NOTIFY loop, inference routes
+│   ├── main.py                # FastAPI app: LISTEN/NOTIFY loop, inference routes, Prefect Deployment trigger
 │   └── db_bootstrap.py        # Idempotent "ensure these 4 databases exist" check
 ├── src/
 │   ├── data.py                 # DVC "ingest" — pulls `train` from Postgres → parquet
@@ -380,7 +389,10 @@ mlops-demand-forecast/
 │   ├── predict_initial.py       # One-shot batch scoring pass at container bootstrap
 │   └── seed_db.py               # Idempotent CSV → Postgres loader
 ├── pipelines/
-│   └── training_pipeline.py     # Prefect flow wrapping the three DVC stages
+│   ├── training_pipeline.py     # Prefect flow wrapping the three DVC stages
+│   └── serve_deployment.py      # Long-lived Prefect Deployment server (flow.serve) — see Walkthrough: A Retraining Cycle
+├── tests/                       # Real pytest coverage for src/, app/, and pipelines/
+├── pytest.ini                    # pythonpath wiring so both import styles used across the repo resolve under pytest
 ├── feature_repo/
 │   ├── feature_store.yaml       # Feast project config
 │   ├── features.py              # Entity + FeatureView + PostgreSQLSource
@@ -397,10 +409,15 @@ mlops-demand-forecast/
 │   ├── init.sql                    # Schema + LISTEN/NOTIFY trigger definitions
 │   └── create-databases.sql        # First-boot CREATE DATABASE for mlflow/prefect/feast
 ├── deploy/
-│   ├── docker-compose.yaml         # 5-service local stack
-│   └── terraform/main.tf            # Full K8s resource graph
-├── scripts/                       # Deployment automation (see above)
-├── .github/workflows/ci.yml        # Lint + test workflow
+│   ├── docker-compose.yaml         # 5-service local stack (reads deploy/.env for credentials)
+│   ├── .env.example                 # Committed shape for deploy/.env (gitignored, holds the real values)
+│   └── terraform/main.tf            # Full K8s resource graph, incl. Secret + Ingress/TLS
+├── scripts/                       # Deployment automation, Docker Desktop + WSL-native Docker variants (see above)
+├── .github/workflows/
+│   ├── ci.yml                      # Lint + real pytest suite, on every push/PR
+│   └── drift-monitoring.yml        # Scheduled monitoring/drift.py run + retraining hook
+├── .dvc/config                     # DVC S3 remote definition (team-shared reproducibility)
+├── .gitignore                      # Keeps k3s.yaml, tfstate, deploy/.env, DVC cache, etc. out of version control
 ├── dvc.yaml                        # DVC stage graph
 └── requirements.txt                 # Full dependency set
 ```
@@ -432,6 +449,12 @@ Grouped by where the pain actually came from.
 - Feature-order mismatches produce plausible-looking but wrong predictions instead of an error. The batch path explicitly slices and reorders columns into the exact training-time order before calling `.predict()`, and logs a warning if an entire batch comes back as a single repeated value.
 - Evidently's 0.7 release restructured the report schema `drift.py` depends on. Rather than get surprised by it, `requirements.txt` pins an explicit upper bound with an inline comment explaining why.
 
+**Secrets, config & scheduling**
+
+- `dvc init --force` unconditionally recreates `.dvc/`, wiping any already-committed `.dvc/config` — including the S3 remote. Since `docker/entrypoint.sh` used to run `dvc init --no-scm --force` on *every* container boot, adding a real committed remote first required making that step conditional (`[ ! -d ".dvc" ]`) so a live container never re-initializes over its own baked-in config.
+- Docker Compose's automatic `.env` loading is resolved relative to **the directory of the first `-f`/`--file` Compose file**, not the shell's current working directory — easy to get backwards, since every deploy script here invokes `docker-compose -f deploy\docker-compose.yaml` from the repo root. `deploy/.env` (not a repo-root `.env`) is the file Compose actually reads for `${POSTGRES_PASSWORD}`-style substitution in `deploy/docker-compose.yaml`.
+- A Kubernetes Secret can't be referenced from *inside* a `command`/`args` string the way a shell would with `$VAR` — MLflow's `--backend-store-uri` flag needed the connection string composed once, in Terraform, into a single secret key (`MLFLOW_BACKEND_STORE_URI`), then injected into `args` via Kubernetes' own `$(VAR_NAME)` command-substitution syntax rather than string-concatenating secret fragments at the Kubernetes level.
+
 ---
 
 ## Getting It Running
@@ -456,13 +479,29 @@ wsl --set-default Ubuntu
 
 **Step 2 — Install Docker Desktop (with WSL2 integration)**
 
-Docker on Windows is managed by Docker Desktop, which bridges the `docker` CLI directly into Ubuntu — Docker is not installed natively inside the WSL2 distro.
+Docker on Windows is normally managed by Docker Desktop, which bridges the `docker` CLI directly into Ubuntu without installing a separate engine there.
 
 1. Install [Docker Desktop for Windows](https://www.docker.com/products/docker-desktop/).
 2. During install, check **"Use WSL 2 instead of Hyper-V."**
 3. Open Docker Desktop → **Settings → Resources → WSL Integration**.
 4. Enable the toggle for **Ubuntu**.
 5. Click **Apply & Restart**.
+
+Docker Desktop is required regardless of which deployment scripts you use — K3s itself, and the plain (non-`_wsl`) scripts, depend on it being installed and running.
+
+**Optional — also install Docker natively inside WSL2, for the `_wsl` scripts**
+
+The `_wsl` variants of every script in [The Automation Scripts](#the-automation-scripts) (`deploy_k3s_clean_wsl.bat`, `deploy_compose_reconcile_wsl.bat`, etc.) run their `docker build`/`docker compose` steps against a **second, independent Docker Engine installed directly inside the WSL2 Ubuntu distro** — not Docker Desktop's — because builds run faster when the build context and image layers never have to cross the Windows↔WSL2 filesystem boundary. To use those scripts, install Docker inside Ubuntu itself:
+
+```bash
+curl -fsSL https://get.docker.com | sudo sh
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+```
+
+(Log out of the Ubuntu shell and back in, or run `newgrp docker`, for the group change to take effect.) The `_wsl` scripts start this daemon automatically (`systemctl start docker`) if it isn't already running, and fail with a clear, actionable error if Docker was never installed inside WSL at all.
+
+Even though this is a completely separate engine from Docker Desktop's, **Docker Desktop's own dashboard can still be used to monitor and inspect whatever it builds or runs** — with WSL Integration enabled for Ubuntu (step 4 above), Docker Desktop's Containers and Images tabs surface containers regardless of which engine actually started them. You don't lose visibility by building through WSL instead of Docker Desktop.
 
 **Step 3 — Install Python, K3s, and Terraform inside Ubuntu**
 
@@ -498,10 +537,12 @@ sudo apt-get update && sudo apt-get install terraform
 git clone https://github.com/benkeddad/mlops-demand-forecast.git
 cd mlops-demand-forecast
 scripts\deploy_compose_clean.bat        :: first run / full rebuild
-scripts\scriptsdeploy_compose_reconcile.bat   :: subsequent runs
+scripts\deploy_compose_reconcile.bat    :: subsequent runs
 ```
 
 Once healthy: API docs at `http://localhost:8000/docs`, MLflow at `http://localhost:5000`, Prefect at `http://localhost:4200`, Postgres at `localhost:5432`.
+
+Have Docker installed natively inside WSL2 as well (see [Prerequisites](#prerequisites-windows--wsl2) above)? Swap in the `_wsl` variants for faster builds — `scripts\deploy_compose_clean_wsl.bat` / `scripts\deploy_compose_reconcile_wsl.bat` — both run **as Administrator** (right-click → Run as administrator), since they need elevated rights to map WSL's ports back to Windows `localhost`.
 
 **Terraform + K3s — production-shaped runtime:**
 
@@ -512,7 +553,7 @@ scripts\deploy_k3s_clean.bat        :: first deploy / clean slate
 scripts\deploy_k3s_reconcile.bat    :: subsequent runs / recovery
 ```
 
-Either script opens four live log/port-forward windows for the API, MLflow, Prefect, and Postgres when it finishes.
+Either script opens four live log/port-forward windows for the API, MLflow, Prefect, and Postgres when it finishes. Same WSL-Docker prerequisite as above? Use `scripts\deploy_k3s_clean_wsl.bat` / `scripts\deploy_k3s_reconcile_wsl.bat` instead — the only difference is where the three custom images get built.
 
 ---
 
@@ -523,12 +564,14 @@ Either script opens four live log/port-forward windows for the API, MLflow, Pref
 | `GET` | `/` | Redirects to the Swagger UI (`/docs`) |
 | `GET` | `/health` | Liveness + model-loaded status |
 | `POST` | `/reload-model` | Forces an immediate reload of the latest registered MLflow model |
+| `POST` | `/trigger-training` | Fires a real Prefect Deployment run of the training pipeline on demand (`run_deployment("Rossmann-Enterprise-Pipeline/production")`), same as an automatic `train_changed` DB notification would — also the hook the scheduled drift-monitoring workflow calls on detected drift |
 | `GET` | `/predict/realtime/{store_id}` | Real-time single-store prediction via the Feast/Redis online store |
 
 ```bash
 curl http://localhost:8000/health
 curl http://localhost:8000/predict/realtime/1
 curl -X POST http://localhost:8000/reload-model
+curl -X POST http://localhost:8000/trigger-training
 ```
 
 Batch prediction has no manually-called endpoint by design — it's triggered automatically by new rows in `test`, or immediately after a retraining cycle finishes.
@@ -542,8 +585,11 @@ Batch prediction has no manually-called endpoint by design — it's triggered au
 | `DATABASE_URL` | `postgresql://user:Password@postgres:5432/rossmann` | Postgres connection string (both the `asyncpg` and SQLAlchemy paths) |
 | `MODEL_URI` | `models:/Rossmann_XGBoost_Model/latest` | MLflow Model Registry URI resolved at load/reload time |
 | `MLFLOW_TRACKING_URI` | `http://mlflow:5000` | MLflow tracking + registry endpoint |
-| `PREFECT_API_URL` | `http://prefect:4200/api` | Prefect server API endpoint |
+| `PREFECT_API_URL` | `http://prefect:4200/api` | Prefect server API endpoint — also what `run_deployment(...)` and `flow.serve()` use to find the server |
+| `TRAINING_SCHEDULE_CRON` | *(unset)* | Optional cron expression (e.g. `"0 3 * * *"`) passed to `pipelines/serve_deployment.py`'s `flow.serve(cron=...)` — adds a periodic retraining schedule on top of the existing `train_changed` DB trigger. Unset by default, so nothing changes unless you opt in. |
 | `WATCHFILES_FORCE_POLLING` | `true` | Forces filesystem-change polling for reliable hot-reload across the Docker Desktop/WSL2 volume boundary |
+
+Postgres credentials are deliberately *not* in this table — Compose reads them from a gitignored `deploy/.env` (`deploy/.env.example` documents the shape) and Terraform reads them from `variable "postgres_user"` / `variable "postgres_password"` (override via `terraform.tfvars` or `TF_VAR_*`), both feeding into the connection strings above rather than being pasted into committed files directly.
 
 ---
 
@@ -554,7 +600,9 @@ Batch prediction has no manually-called endpoint by design — it's triggered au
 1. Checks out the repo, sets up **Python 3.9**.
 2. Installs `flake8`, `pytest`, and `requirements.txt`.
 3. Lints with `flake8 --select=E9,F63,F7,F82` — fatal syntax errors and undefined names only, so the build fails fast on genuinely broken code rather than style nitpicks.
-4. Runs `pytest` (currently a placeholder — real coverage is on the roadmap).
+4. Runs `pytest -v` against the real suite in [`tests/`](tests/) — covering `src/evaluate.py`, `src/model.py`, `src/features.py`, `src/data.py`, `app/db_bootstrap.py`, and the Prefect task/flow wiring in `pipelines/` — and now actually fails the build on a real test failure instead of always passing.
+
+A second workflow, `.github/workflows/drift-monitoring.yml`, runs on its own daily `schedule` (plus `workflow_dispatch` for on-demand runs): it seeds a throwaway Postgres service container, runs `monitoring/drift.py --fail-on-drift`, uploads the HTML report as a build artifact, and — if `RETRAIN_TRIGGER_URL` is configured as a repository variable — calls a deployed instance's `POST /trigger-training` when drift crosses the threshold.
 
 ---
 
@@ -562,22 +610,33 @@ Batch prediction has no manually-called endpoint by design — it's triggered au
 
 Deliberate shortcuts, flagged explicitly rather than left for someone else to discover:
 
-- Postgres credentials are hardcoded in plaintext in `deploy/docker-compose.yaml` and `deploy/terraform/main.tf`, rather than injected via Docker secrets or a Kubernetes `Secret`.
-- Every Kubernetes `Service` is `type: LoadBalancer`, which on a single-node K3s cluster is effectively a NodePort — there's no ingress controller, TLS termination, or auth in front of anything.
+- Postgres credentials now live in a Kubernetes `Secret` (Terraform) and a gitignored `deploy/.env` (Compose) instead of being hardcoded in `main.tf`/`docker-compose.yaml` — but the *default* values in both are still the same well-known demo password (`user`/`Password`), and `feature_repo/feature_store.yaml`'s Feast config still hardcodes them directly. None of this comes from a real secrets manager (Vault, AWS Secrets Manager, etc.) — a real deployment must override `terraform.tfvars`/`deploy/.env` with its own values.
+- The Kubernetes Ingress in front of the stack terminates TLS with a **self-signed certificate** generated by Terraform (`tls_self_signed_cert`) — fine for a demo, but browsers/clients will flag it, and there's still no authentication in front of the ingress or the `/trigger-training` endpoint. Every `Service` also remains `type: LoadBalancer` alongside the new Ingress, so the original direct-port access pattern (`localhost:8000`, etc.) keeps working unchanged.
 - MLflow, Prefect, and Feast's registry each have their own Postgres database, but all four databases live on the **same single Postgres instance** — one outage takes down data, tracking, orchestration, and feature metadata together. MLflow's model artifacts also sit on a single PVC rather than an object store, which won't scale past one node.
-- Training is triggered as an ad-hoc `subprocess` from the API process, not a scheduled/deployed Prefect flow run — fine for a single-node demo, not how you'd trigger training behind a multi-replica API.
-- `monitoring/drift.py` supports `--fail-on-drift` specifically so it can be automated, but nothing currently calls it on a schedule.
+- Training now runs as a real Prefect Deployment (`pipelines/serve_deployment.py`, triggered via `run_deployment(...)`) instead of an ad-hoc `subprocess` call, but the deployment server itself is still just a second subprocess launched by the API process (via `flow.serve()`), not a dedicated worker behind a work pool — it goes down with the API container and doesn't scale independently of it.
+- `monitoring/drift.py`'s `--fail-on-drift` flag is now exercised by a real scheduled job (`.github/workflows/drift-monitoring.yml`), but that job runs against a throwaway, freshly-seeded Postgres container in CI, not the actual deployed stack — wiring its `RETRAIN_TRIGGER_URL` to a real, reachable, *authenticated* deployment is still left to whoever deploys this for real.
+- The DVC S3 remote (`.dvc/config`) points at a placeholder bucket name (`rossmann-mlops-dvc-store`) that doesn't exist anywhere — `dvc remote modify storage url s3://<your-bucket>/dvc-store` plus standard AWS credentials (env vars or `~/.aws/credentials`) are required before `dvc push`/`dvc pull` actually work against a real bucket.
 
 ---
 
 ## What's Next
 
-- [ ] Real `pytest` coverage for `src/`, `app/`, and `pipelines/`
-- [ ] DVC remote storage on S3/GCS instead of local disk, for team-shared reproducibility
-- [ ] Kubernetes `Secret`s instead of plaintext Postgres credentials
-- [ ] A proper scheduled/deployed Prefect flow run instead of the ad-hoc `subprocess` trigger
-- [ ] Ingress + TLS in front of the Kubernetes services
-- [ ] Actually schedule `monitoring/drift.py` — cron, a GitHub Actions job, or its own Prefect deployment that calls `--fail-on-drift` and triggers `pipelines/training_pipeline.py` on failure
+Recently closed out (see [Known Limitations](#known-limitations) above for the honest caveats on each):
+
+- [x] Real `pytest` coverage for `src/`, `app/`, and `pipelines/` — see [`tests/`](tests/), run via `pytest`
+- [x] DVC remote storage on S3 instead of local disk — [`.dvc/config`](.dvc/config), `dvc[s3]` in `requirements.txt`
+- [x] Kubernetes `Secret` + gitignored `deploy/.env` instead of plaintext Postgres credentials
+- [x] A real scheduled/deployed Prefect flow run ([`pipelines/serve_deployment.py`](pipelines/serve_deployment.py) + `run_deployment(...)`) instead of the ad-hoc `subprocess` trigger
+- [x] Ingress + TLS in front of the Kubernetes services (K3s' built-in Traefik + a self-signed cert)
+- [x] `monitoring/drift.py` now runs on a schedule via [`.github/workflows/drift-monitoring.yml`](.github/workflows/drift-monitoring.yml)
+
+Still open:
+
+- [ ] Swap the self-signed ingress certificate for a CA-signed one (e.g. cert-manager + Let's Encrypt), and put real authentication in front of the ingress and `/trigger-training`
+- [ ] Pull Postgres/Feast credentials from a real secrets manager (Vault, AWS Secrets Manager) instead of `terraform.tfvars` / `deploy/.env`
+- [ ] Point `RETRAIN_TRIGGER_URL` at an actual reachable deployment, and track the scheduled drift job's own history over time instead of only its latest run
+- [ ] Move the Prefect deployment server behind a real work pool + worker instead of a second subprocess living inside the API container
+- [ ] Split Postgres, MLflow, and Feast onto separate instances (or at least separate volumes) so one outage doesn't take down every subsystem at once
 
 ---
 

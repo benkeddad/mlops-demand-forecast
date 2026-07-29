@@ -45,6 +45,15 @@ echo Docker Engine was found inside WSL. Using it instead of Docker Desktop.
 echo.
 
 echo =======================================================
+echo   Checking LocalStack (S3) for DVC Remote Storage
+echo =======================================================
+echo.
+
+wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
+
+echo.
+
+echo =======================================================
 echo   Rossmann MLOps Non-Destructive Recovery Startup
 echo =======================================================
 echo.

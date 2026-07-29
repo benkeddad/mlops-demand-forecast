@@ -3,9 +3,11 @@ provider: local
 entity_key_serialization_version: 2
 
 # FEAST CHANGE: Point registry to the SQL database instead of a local file
+# path is explicitly postgresql+psycopg (not plain postgresql) to silence
+# Feast's startup warning about which SQLAlchemy driver it defaults to.
 registry:
   registry_type: sql
-  path: postgresql://user:Password@postgres:5432/feast
+  path: postgresql+psycopg://user:Password@postgres:5432/feast
 
 offline_store:
   type: postgres

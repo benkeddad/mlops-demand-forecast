@@ -52,6 +52,15 @@ echo Docker Engine and Compose were found inside WSL. Using them instead of Dock
 echo.
 
 echo =======================================================
+echo   Checking LocalStack (S3) for DVC Remote Storage
+echo =======================================================
+echo.
+
+wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
+
+echo.
+
+echo =======================================================
 echo   Checking Administrator Privileges
 echo =======================================================
 echo.

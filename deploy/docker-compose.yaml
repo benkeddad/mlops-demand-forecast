@@ -9,15 +9,15 @@ services:
     container_name: rossmann_postgres
     # ADDED: Healthcheck to ensure Postgres is actually ready
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U user -d rossmann"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
     # END OF CHANGE
     environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: Password
-      POSTGRES_DB: rossmann
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
@@ -57,7 +57,7 @@ services:
       mlflow server
         --host 0.0.0.0
         --port 5000
-        --backend-store-uri postgresql://user:Password@postgres:5432/mlflow
+        --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/mlflow
         --default-artifact-root /mlflow/artifacts
         --allowed-hosts "*"
     # CHANGED: Require postgres to start first, and restart if connection fails initially
@@ -84,7 +84,7 @@ services:
       - "4200:4200"
     environment:
       # Change 'prefect' back to 'rossmann'
-      - PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://user:Password@postgres:5432/prefect
+      - PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/prefect
     command: prefect server start --host 0.0.0.0
     # CHANGED: Require postgres to start first, and restart if connection fails initially
     depends_on:
@@ -114,7 +114,7 @@ services:
       - mlflow_data:/mlflow
     working_dir: /app
     environment:
-      - DATABASE_URL=postgresql://user:Password@postgres:5432/rossmann
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/rossmann
       - MODEL_URI=models:/Rossmann_XGBoost_Model/latest
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - PREFECT_API_URL=http://prefect:4200/api

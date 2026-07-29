@@ -1,0 +1,39 @@
+from unittest.mock import patch
+
+from pipelines.training_pipeline import (
+    dvc_featurize,
+    dvc_ingest,
+    dvc_train,
+    ml_training_pipeline,
+)
+
+
+def test_pipeline_flow_is_named_for_the_prefect_ui():
+    assert ml_training_pipeline.name == "Rossmann-Enterprise-Pipeline"
+
+
+def test_ingest_stage_forces_dvc_repro():
+    # --force bypasses DVC's cache check, because the real change happened
+    # inside Postgres, which DVC has no visibility into.
+    with patch("pipelines.training_pipeline.subprocess.run") as mock_run:
+        dvc_ingest.fn()
+    mock_run.assert_called_once()
+    args, kwargs = mock_run.call_args
+    assert args[0] == ["dvc", "repro", "--force", "ingest"]
+    assert kwargs["check"] is True
+
+
+def test_featurize_stage_runs_plain_dvc_repro():
+    with patch("pipelines.training_pipeline.subprocess.run") as mock_run:
+        dvc_featurize.fn()
+    args, kwargs = mock_run.call_args
+    assert args[0] == ["dvc", "repro", "featurize"]
+    assert kwargs["check"] is True
+
+
+def test_train_stage_runs_plain_dvc_repro():
+    with patch("pipelines.training_pipeline.subprocess.run") as mock_run:
+        dvc_train.fn()
+    args, kwargs = mock_run.call_args
+    assert args[0] == ["dvc", "repro", "train"]
+    assert kwargs["check"] is True

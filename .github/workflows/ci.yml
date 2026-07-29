@@ -31,5 +31,4 @@ jobs:
         
     - name: Test with pytest
       run: |
-        # Ensure you create a tests/ folder later to run actual tests
-        pytest || echo "No tests found yet."
+        pytest -v

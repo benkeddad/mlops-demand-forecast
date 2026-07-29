@@ -8,12 +8,66 @@ terraform {
       source  = "hashicorp/kubernetes"
       version = "~> 2.24.0" 
     }
+    # Claude added: only used to mint the self-signed cert for the ingress
+    # below - no external CA or DNS provider needed for a local K3s demo.
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 }
 
 # 2. Point Terraform directly to your K3s cluster credentials
 provider "kubernetes" {
   config_path = "${path.module}/k3s.yaml"
+}
+
+# Claude added: credentials as variables instead of hardcoded literals, so the
+# actual values live in a Kubernetes Secret (below) instead of being pasted
+# directly into every Deployment resource. Defaults match the project's
+# existing demo credentials so `terraform apply` still works with zero flags -
+# a real deployment overrides these via terraform.tfvars (gitignored) or
+# TF_VAR_postgres_password / TF_VAR_postgres_user environment variables
+# instead of editing this file.
+variable "postgres_user" {
+  description = "PostgreSQL superuser name shared by every service in the stack."
+  type        = string
+  default     = "user"
+}
+
+variable "postgres_password" {
+  description = "PostgreSQL superuser password. Override via terraform.tfvars or TF_VAR_postgres_password for a real deployment."
+  type        = string
+  default     = "Password"
+  sensitive   = true
+}
+
+variable "postgres_db" {
+  description = "Name of the primary application database (train/test tables)."
+  type        = string
+  default     = "rossmann"
+}
+
+# NEW: A real Kubernetes Secret instead of the plaintext env values every
+# Deployment below used to declare inline (see Known Limitations in the
+# README). Storing the fully-composed connection strings as their own keys
+# means no Deployment has to concatenate user/password fragments together.
+resource "kubernetes_secret" "postgres_credentials" {
+  metadata {
+    name = "postgres-credentials"
+  }
+
+  data = {
+    POSTGRES_USER     = var.postgres_user
+    POSTGRES_PASSWORD = var.postgres_password
+    POSTGRES_DB       = var.postgres_db
+
+    API_DATABASE_URL         = "postgresql://${var.postgres_user}:${var.postgres_password}@postgres:5432/${var.postgres_db}"
+    MLFLOW_BACKEND_STORE_URI = "postgresql://${var.postgres_user}:${var.postgres_password}@postgres:5432/mlflow"
+    PREFECT_DB_URL           = "postgresql+asyncpg://${var.postgres_user}:${var.postgres_password}@postgres:5432/prefect"
+  }
+
+  type = "Opaque"
 }
 
 #Step 2: The PostgreSQL & Redis Backend
@@ -81,16 +135,31 @@ resource "kubernetes_deployment" "postgres" {
           image_pull_policy = "IfNotPresent"
 
           env {
-            name  = "POSTGRES_USER"
-            value = "user"
+            name = "POSTGRES_USER"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.postgres_credentials.metadata[0].name
+                key  = "POSTGRES_USER"
+              }
+            }
           }
           env {
-            name  = "POSTGRES_PASSWORD"
-            value = "Password"
+            name = "POSTGRES_PASSWORD"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.postgres_credentials.metadata[0].name
+                key  = "POSTGRES_PASSWORD"
+              }
+            }
           }
           env {
-            name  = "POSTGRES_DB"
-            value = "rossmann"
+            name = "POSTGRES_DB"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.postgres_credentials.metadata[0].name
+                key  = "POSTGRES_DB"
+              }
+            }
           }
 
           port {
@@ -259,13 +328,24 @@ resource "kubernetes_deployment" "mlflow" {
           # END OF CHANGE
           image_pull_policy = "IfNotPresent"
           
+          # Claude changed: the connection string is now read from the Secret
+          # via an env var, then referenced in args with Kubernetes' native
+          # $(VAR_NAME) command substitution - no plaintext password here.
+          env {
+            name = "MLFLOW_BACKEND_STORE_URI"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.postgres_credentials.metadata[0].name
+                key  = "MLFLOW_BACKEND_STORE_URI"
+              }
+            }
+          }
+
           args = [
             "mlflow", "server",
             "--host", "0.0.0.0",
             "--port", "5000",
-            # CHANGED: Point backend-store-uri to the 'mlflow' database instead of 'rossmann'
-            "--backend-store-uri", "postgresql://user:Password@postgres:5432/mlflow",
-            # END OF CHANGE
+            "--backend-store-uri", "$(MLFLOW_BACKEND_STORE_URI)",
             "--default-artifact-root", "/mlflow/artifacts",
             "--allowed-hosts", "*"
           ]
@@ -367,10 +447,13 @@ resource "kubernetes_deployment" "prefect" {
           args = ["prefect", "server", "start", "--host", "0.0.0.0"]
 
           env {
-            name  = "PREFECT_API_DATABASE_CONNECTION_URL"
-            # CHANGED: Point the connection URL to the 'prefect' database instead of 'rossmann'
-            value = "postgresql+asyncpg://user:Password@postgres:5432/prefect"
-            # END OF CHANGE
+            name = "PREFECT_API_DATABASE_CONNECTION_URL"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.postgres_credentials.metadata[0].name
+                key  = "PREFECT_DB_URL"
+              }
+            }
           }
 
           port {
@@ -459,8 +542,13 @@ resource "kubernetes_deployment" "api" {
 
           # Injected environment configurations matching your project requirements
           env {
-            name  = "DATABASE_URL"
-            value = "postgresql://user:Password@postgres:5432/rossmann"
+            name = "DATABASE_URL"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.postgres_credentials.metadata[0].name
+                key  = "API_DATABASE_URL"
+              }
+            }
           }
           env {
             name  = "MODEL_URI"
@@ -513,6 +601,134 @@ resource "kubernetes_service" "api" {
     port {
       port        = 8000
       target_port = 8000
+    }
+  }
+}
+
+#Step 5: Ingress + TLS in front of the Kubernetes services.
+# NEW: Every Service above stays `type: LoadBalancer` exactly as it was
+# (nothing here changes an existing port-forward/URL from the README or the
+# deploy scripts) - this section layers a single HTTPS front door on top,
+# using K3s' built-in Traefik ingress controller, which needs no extra
+# install step on a stock K3s cluster.
+
+# 1. A self-signed certificate. Good enough to get real TLS termination in
+# front of the cluster for a local demo; swap for a cert-manager-issued or
+# CA-signed certificate for anything beyond that.
+resource "tls_private_key" "ingress" {
+  algorithm = "RSA"
+  rsa_bits  = 2048
+}
+
+resource "tls_self_signed_cert" "ingress" {
+  private_key_pem = tls_private_key.ingress.private_key_pem
+
+  subject {
+    common_name  = "rossmann.local"
+    organization = "Rossmann MLOps Demo"
+  }
+
+  validity_period_hours = 8760 # 1 year
+  allowed_uses = [
+    "key_encipherment",
+    "digital_signature",
+    "server_auth",
+  ]
+
+  dns_names = [
+    "rossmann.local",
+    "api.rossmann.local",
+    "mlflow.rossmann.local",
+    "prefect.rossmann.local",
+  ]
+}
+
+# 2. The cert/key pair as a real Kubernetes TLS Secret, referenced by the
+# Ingress below.
+resource "kubernetes_secret" "ingress_tls" {
+  metadata {
+    name = "rossmann-ingress-tls"
+  }
+
+  type = "kubernetes.io/tls"
+
+  data = {
+    "tls.crt" = tls_self_signed_cert.ingress.cert_pem
+    "tls.key" = tls_private_key.ingress.private_key_pem
+  }
+}
+
+# 3. One Ingress, three name-based virtual hosts - the API, the MLflow UI,
+# and the Prefect UI all terminate TLS at the same entry point instead of
+# each needing its own externally-exposed port.
+resource "kubernetes_ingress_v1" "rossmann" {
+  depends_on = [
+    kubernetes_service.api,
+    kubernetes_service.mlflow,
+    kubernetes_service.prefect,
+  ]
+
+  metadata {
+    name = "rossmann-ingress"
+    annotations = {
+      "traefik.ingress.kubernetes.io/router.entrypoints" = "websecure"
+    }
+  }
+
+  spec {
+    ingress_class_name = "traefik"
+
+    tls {
+      hosts       = ["api.rossmann.local", "mlflow.rossmann.local", "prefect.rossmann.local"]
+      secret_name = kubernetes_secret.ingress_tls.metadata[0].name
+    }
+
+    rule {
+      host = "api.rossmann.local"
+      http {
+        path {
+          path      = "/"
+          path_type = "Prefix"
+          backend {
+            service {
+              name = kubernetes_service.api.metadata[0].name
+              port { number = 8000 }
+            }
+          }
+        }
+      }
+    }
+
+    rule {
+      host = "mlflow.rossmann.local"
+      http {
+        path {
+          path      = "/"
+          path_type = "Prefix"
+          backend {
+            service {
+              name = kubernetes_service.mlflow.metadata[0].name
+              port { number = 5000 }
+            }
+          }
+        }
+      }
+    }
+
+    rule {
+      host = "prefect.rossmann.local"
+      http {
+        path {
+          path      = "/"
+          path_type = "Prefix"
+          backend {
+            service {
+              name = kubernetes_service.prefect.metadata[0].name
+              port { number = 4200 }
+            }
+          }
+        }
+      }
     }
   }
 }

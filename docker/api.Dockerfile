@@ -7,7 +7,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
 # Copy application files into the image.
 COPY app/ app/
@@ -15,6 +17,8 @@ COPY pipelines/ pipelines/
 COPY src/ src/
 COPY monitoring/ monitoring/
 COPY dvc.yaml .
+COPY .dvc/ .dvc/
+COPY .dvcignore .
 COPY feature_repo/ feature_repo/
 COPY data/ data/
 

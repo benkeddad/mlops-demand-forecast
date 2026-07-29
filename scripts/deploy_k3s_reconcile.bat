@@ -5,6 +5,15 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0.."
 
 echo =======================================================
+echo   Checking LocalStack (S3) for DVC Remote Storage
+echo =======================================================
+echo.
+
+wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
+
+echo.
+
+echo =======================================================
 echo   Rossmann MLOps Non-Destructive Recovery Startup
 echo =======================================================
 echo.

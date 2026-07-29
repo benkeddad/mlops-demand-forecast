@@ -45,6 +45,15 @@ echo Docker Engine was found inside WSL. Using it instead of Docker Desktop.
 echo.
 
 echo =======================================================
+echo   Checking LocalStack (S3) for DVC Remote Storage
+echo =======================================================
+echo.
+
+wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
+
+echo.
+
+echo =======================================================
 echo   [1/6] Resetting WSL Subsystem & Starting K3s Server
 echo =======================================================
 
@@ -203,6 +212,9 @@ configmap/postgres-init-config ^
 pvc/postgres-data-pvc ^
 pvc/mlflow-data-pvc ^
 pvc/prefect-data-pvc ^
+secret/postgres-credentials ^
+secret/rossmann-ingress-tls ^
+ingress/rossmann-ingress ^
 --ignore-not-found
 
 if errorlevel 1 (

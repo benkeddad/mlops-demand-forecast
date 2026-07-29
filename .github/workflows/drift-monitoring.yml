@@ -1,0 +1,95 @@
+name: Scheduled Drift Monitoring
+
+# Runs monitoring/drift.py on a schedule against a throwaway Postgres service
+# container seeded from the same CSVs the real stack uses, so this is a real,
+# self-contained drift check rather than a placeholder. On drift, it fails
+# the job (so it shows up as a red run in the Actions tab) and - if
+# RETRAIN_TRIGGER_URL is configured - calls a deployed instance's
+# POST /trigger-training endpoint to close the loop automatically.
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily at 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  check-drift:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: Password
+          POSTGRES_DB: rossmann
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U user -d rossmann"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://user:Password@localhost:5432/rossmann
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends postgresql-client
+          pip install -r requirements.txt
+
+      - name: Load schema and seed reference/current data
+        run: |
+          psql "$DATABASE_URL" -f db/init.sql
+          python src/seed_db.py
+
+      - name: Run drift check (train = reference, test = current)
+        id: drift
+        continue-on-error: true
+        run: |
+          python monitoring/drift.py --reference-table train --current-table test \
+            --drift-share-threshold 0.3 --fail-on-drift --skip-mlflow
+
+      # No live MLflow server exists in this isolated CI job (--skip-mlflow
+      # above), so drift history from scheduled runs isn't logged anywhere
+      # durable yet - only this job's own logs/artifacts.
+      - name: Upload drift report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-report
+          path: monitoring/reports/
+          if-no-files-found: ignore
+
+      - name: Trigger retraining on a deployed instance
+        if: steps.drift.outcome == 'failure'
+        env:
+          RETRAIN_TRIGGER_URL: ${{ vars.RETRAIN_TRIGGER_URL }}
+        run: |
+          if [ -z "$RETRAIN_TRIGGER_URL" ]; then
+            echo "Drift detected, but no RETRAIN_TRIGGER_URL repository variable is configured."
+            echo "Set it to a deployed instance's /trigger-training URL to close the loop automatically."
+            exit 0
+          fi
+          # NOTE: /trigger-training has no authentication in front of it yet
+          # (see README Known Limitations) - only point this at an instance
+          # that's not publicly reachable, or add auth before doing so.
+          curl --fail -X POST "$RETRAIN_TRIGGER_URL"
+
+      - name: Fail this run if drift was detected
+        if: steps.drift.outcome == 'failure'
+        run: |
+          echo "Data drift exceeded the configured threshold - see the 'Run drift check' step and the uploaded drift-report artifact."
+          exit 1
