@@ -17,7 +17,14 @@ def run_training(processed_data_path: str):
     processed_df = pd.read_parquet(processed_data_path)
 
     X_train, X_val, y_train, y_val = split_data(processed_df, target_col='Sales')
-    mlflow.set_experiment("Rossmann_Sales_Forecasting")
+    # NEW: renamed from "Rossmann_Sales_Forecasting" when the MLflow server's
+    # --default-artifact-root moved to S3. MLflow records each experiment's
+    # artifact_location at creation time and never changes it afterwards, so
+    # the old experiment would keep writing to its original local PVC path
+    # forever even after the server-wide default changed. A fresh experiment
+    # name is required to actually pick up the new S3-backed root; the old
+    # experiment (and its run/model history) is untouched and still browsable.
+    mlflow.set_experiment("Rossmann_Sales_Forecasting_v2")
 
     with mlflow.start_run():
         # Store metadata reference to the exact parquet data used for training

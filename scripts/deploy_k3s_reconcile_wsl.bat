@@ -4,10 +4,11 @@ setlocal enabledelayedexpansion
 :: This script lives in scripts\, so move to the repository root.
 cd /d "%~dp0.."
 
-:: WSL-Docker variant of deploy_k3s_reconcile.bat: identical logic. This
-:: script does not call Docker directly (only k3s/kubectl and Terraform
-:: through WSL), but it still verifies Docker Engine is available inside
-:: the WSL Ubuntu distro (instead of Docker Desktop) for consistency with
+:: Non-destructive K3s reconciliation, with image builds run against the
+:: Docker Engine installed inside the WSL Ubuntu distro (not Docker Desktop's
+:: own engine). This script does not call Docker directly for its own logic
+:: (only k3s/kubectl and Terraform through WSL), but it still verifies Docker
+:: Engine is available inside WSL Ubuntu for consistency with
 :: the rest of the WSL-Docker script set.
 
 echo =======================================================

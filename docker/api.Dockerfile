@@ -17,7 +17,12 @@ COPY pipelines/ pipelines/
 COPY src/ src/
 COPY monitoring/ monitoring/
 COPY dvc.yaml .
-COPY .dvc/ .dvc/
+# Only the committed, shared remote pointer - NOT .dvc/config.local (dev-
+# machine-only LocalStack endpoint/creds, meaningless inside a container's
+# own network namespace anyway - 127.0.0.1 there means the container itself,
+# not the WSL host LocalStack listens on) or .dvc/tmp/ (DVC's own runtime
+# scratch dir).
+COPY .dvc/config .dvc/config
 COPY .dvcignore .
 COPY feature_repo/ feature_repo/
 COPY data/ data/

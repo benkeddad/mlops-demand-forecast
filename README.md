@@ -112,7 +112,7 @@ Every entry below traces to something real in the repo — a line in `requiremen
 |---|---|
 | PostgreSQL 15 (`postgres:15-alpine`) | System of record for `train`/`test`; also hosts three more logical databases (`mlflow`, `prefect`, `feast`) on the same instance; source of the `pg_notify` events that drive the whole loop |
 | Redis 7 (`redis:7-alpine`) | Feast's online store — the sub-10ms feature cache the real-time endpoint reads from |
-| DVC `[s3]>=3.50.0` (+ `dvc-objects`, `pathspec` version floors added for Windows compatibility) | Content-hashes the `ingest → featurize → train` stage graph so nothing reruns unless its actual inputs changed; the `[s3]` extra plus `.dvc/config`'s `storage` remote let `dvc push`/`dvc pull` share cached artifacts with a team instead of staying local-disk-only |
+| DVC `[s3]==3.67.1` (+ `dvc-s3==3.3.0`, `aiobotocore==2.26.0`, `botocore>=1.41.0,<1.41.6` pinned as an exact chain, `dvc-objects`/`pathspec` version floors for Windows compatibility — see [Hard-Won Lessons](#hard-won-lessons)) | Content-hashes the `ingest → featurize → train` stage graph so nothing reruns unless its actual inputs changed; the `[s3]` extra plus `.dvc/config`'s `storage` remote let `dvc push`/`dvc pull` share cached artifacts with a team instead of staying local-disk-only. `docker/entrypoint.sh` also points this remote at LocalStack automatically at container boot (reusing MLflow's own `MLFLOW_S3_ENDPOINT_URL`/`AWS_*` env vars) and `pipelines/training_pipeline.py` runs an explicit `dvc push` task after every training run, so DVC-tracked data lands in S3 with no manual step |
 
 **Feature & ML Layer**
 | Tool | What it's doing here |
@@ -121,12 +121,12 @@ Every entry below traces to something real in the repo — a line in `requiremen
 | XGBoost `>=1.7.0` | `XGBRegressor` forecasting daily per-store sales, `objective="reg:squarederror"` |
 | scikit-learn `>=1.2.0` | `train_test_split` for the validation split |
 | pandas / NumPy / PyArrow | DataFrame transforms and fast Parquet I/O between DVC stages |
-| MLflow `>=2.10.0` | Experiment tracking, dataset lineage (`mlflow.log_input`), and the Model Registry entry the API resolves at load time |
+| MLflow `>=2.10.0` + `boto3==1.41.5` (pinned to the same `botocore` range DVC's `[s3]` chain needs — see [Hard-Won Lessons](#hard-won-lessons)) | Experiment tracking, dataset lineage (`mlflow.log_input`), and the Model Registry entry the API resolves at load time; the actual model artifacts (`model.xgb`, `MLmodel`, etc. — not run metadata, which stays in Postgres) are written directly to an S3-compatible bucket via `MLFLOW_S3_ENDPOINT_URL`/`AWS_*` env vars instead of the local filesystem |
 
 **Orchestration Layer**
 | Tool | What it's doing here |
 |---|---|
-| Prefect 2 `>=2.14.0,<3.0.0` (self-hosted server) | Wraps the three DVC stages as a named, retryable flow with a run-history UI, persisting its own state to a dedicated `prefect` Postgres database |
+| Prefect 2 `>=2.14.0,<2.15.0` (self-hosted server; client pinned to the server's exact minor version — see [Hard-Won Lessons](#hard-won-lessons)) + `griffe<1.0.0` | Wraps the three DVC stages as a named, retryable flow with a run-history UI, persisting its own state to a dedicated `prefect` Postgres database |
 
 **Serving Layer**
 | Tool | What it's doing here |
@@ -187,6 +187,7 @@ sequenceDiagram
     participant DVC as DVC stages
     participant MLF as MLflow Server
     participant MLFDB as Postgres: mlflow db
+    participant S3 as S3 (LocalStack)
 
     Note over PG: INSERT / UPDATE / DELETE on train
     PG->>API: pg_notify('train_changed', 'update')
@@ -202,15 +203,20 @@ sequenceDiagram
     PRF->>DVC: dvc repro train
     DVC->>MLF: log_model + register (Rossmann_XGBoost_Model)
     activate MLF
+    MLF->>S3: PUT model.xgb, MLmodel, conda.yaml, ...
     MLF->>MLFDB: INSERT run params, metrics,<br/>dataset lineage, registry entry
     MLF-->>DVC: run + version confirmed
     deactivate MLF
     PRF->>PRFDB: log task run: train = Completed
+    PRF->>DVC: dvc push
+    DVC->>S3: PUT content-hashed clean_data.parquet, train_features.parquet
+    PRF->>PRFDB: log task run: push = Completed
     PRF->>PRFDB: mark flow run = Completed
     deactivate PRF
     PRF-->>API: flow run reaches a terminal state (polled via read_flow_run)
     API->>MLF: pyfunc.load_model(models:/.../latest)
     MLF->>MLFDB: SELECT latest registry version
+    MLF->>S3: GET model.xgb, MLmodel, ...
     MLF-->>API: model artifact
     API->>PG: perform_batch_prediction() as a background task
 ```
@@ -223,6 +229,7 @@ A few details worth calling out:
 - The moment training finishes, the API doesn't just reload the model — it immediately fires a fresh batch-prediction pass in the background, so any rows sitting in `test` get scored against the model that was *just* registered, not the stale one from before.
 - Notice `PRFDB` and `MLFDB` are drawn as separate participants but are the exact same Postgres server as `PG` under the hood — Prefect's flow/task-run bookkeeping and MLflow's run/registry bookkeeping are both durable database writes, not in-memory state that a container restart would wipe out.
 - `run_deployment("Rossmann-Enterprise-Pipeline/production")` targets a real Prefect Deployment, not the flow function directly — it's registered once at API startup by a second long-lived subprocess (`pipelines/serve_deployment.py`, launched from `app/main.py`'s `lifespan`) calling `flow.serve(name="production")`. The same deployment is reachable from `POST /trigger-training` for manual/automated triggers outside the DB-write path (see [API Surface](#api-surface)), and can optionally be put on a cron schedule via `TRAINING_SCHEDULE_CRON` on top of the DB trigger.
+- `S3` is the same LocalStack instance for both DVC and MLflow, but two separate buckets (`rossmann-mlops-dvc-store`, `rossmann-mlflow-artifacts`) and two very different write paths: MLflow writes to S3 *synchronously, inside* `log_model()` — the moment training finishes, the artifact is already there. DVC's `dvc repro` never talks to a remote at all; it only ever touches the local cache. That's why `dvc push` is its own explicit 4th Prefect task (`pipelines/training_pipeline.py`) run once training completes, not something that happens automatically as a side effect of the other three stages.
 
 ---
 
@@ -320,7 +327,7 @@ One quiet but real piece of engineering: `requirements.txt` pins `evidently>=0.4
 | **Where it runs** | Any host with Docker Desktop | K3s inside WSL2 (Windows) |
 | **How services are declared** | `deploy/docker-compose.yaml` | `deploy/terraform/main.tf` |
 | **MLflow / Prefect images** | Built locally from `docker/mlflow.Dockerfile` / `docker/prefect.Dockerfile` | Same Dockerfiles, built then `docker save`'d into K3s' containerd cache |
-| **Storage** | Named Docker volumes | `PersistentVolumeClaim`s (2Gi / 2Gi / 1Gi) |
+| **Storage** | Named Docker volumes, plus an S3-compatible LocalStack bucket for MLflow artifacts | `PersistentVolumeClaim`s (2Gi / 2Gi / 1Gi), plus the same LocalStack S3 bucket for MLflow artifacts |
 | **Networking** | Docker bridge network | Kubernetes `LoadBalancer` Services |
 | **Startup dependency handling** | `depends_on: condition: service_healthy` against a real `pg_isready` healthcheck | `depends_on` on the Terraform resources themselves, so `terraform apply`'s ordering mirrors the runtime dependency graph |
 | **Best for** | Local iteration, hot-reload dev loop | A runtime that actually looks like Kubernetes |
@@ -333,9 +340,10 @@ Both paths converge on the same five services — `postgres`, `redis`, `mlflow`,
 
 `deploy/terraform/main.tf` (Terraform `>= 1.0.0`, providers `hashicorp/kubernetes ~> 2.24.0` and `hashicorp/tls ~> 4.0`) declares the full resource graph declaratively:
 
-- **Three `PersistentVolumeClaim`s** — Postgres (2Gi), MLflow (2Gi), Prefect (1Gi) — each set with `wait_until_bound = false`, a deliberate fix for a K3s-specific provisioner deadlock (details in [Hard-Won Lessons](#hard-won-lessons)).
+- **Three `PersistentVolumeClaim`s** — Postgres (2Gi), MLflow (2Gi), Prefect (1Gi) — each set with `wait_until_bound = false`, a deliberate fix for a K3s-specific provisioner deadlock (details in [Hard-Won Lessons](#hard-won-lessons)). The MLflow PVC is still mounted, but is now effectively legacy storage: MLflow only ever resolves it for experiments that existed *before* the S3 migration below — every experiment created since writes straight to S3 instead (see [Hard-Won Lessons](#hard-won-lessons) for why that's an MLflow-wide rule, not a config toggle).
 - **Four backing `Deployment` + `LoadBalancer Service` pairs** for Postgres, Redis, MLflow, and Prefect, all with `image_pull_policy = "IfNotPresent"` so images pre-imported into containerd are reused rather than re-fetched.
-- **The `rossmann-api` `Deployment`**, which declares an explicit `depends_on` against all four backing services and mounts the *same* MLflow `PersistentVolumeClaim` the MLflow server itself writes to — letting the API read freshly registered model artifacts straight off the shared volume without needing an S3-compatible artifact store.
+- **A `kubernetes_secret` (`s3-credentials`)** plus a `localstack_endpoint` variable, feeding MLflow's `--default-artifact-root` (`s3://rossmann-mlflow-artifacts/mlflow-artifacts` instead of the old PVC path) and matching `MLFLOW_S3_ENDPOINT_URL`/`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_DEFAULT_REGION` env vars on both the `mlflow` and `rossmann-api` Deployments. The endpoint value is deliberately the K3s node's real IP, not `127.0.0.1`/`localhost` (see [Hard-Won Lessons](#hard-won-lessons)).
+- **The `rossmann-api` `Deployment`**, which declares an explicit `depends_on` against all four backing services. It still mounts the same MLflow `PersistentVolumeClaim` the MLflow server writes to, purely for backward compatibility with pre-migration model versions — freshly registered models are resolved straight from S3 via `mlflow.pyfunc.load_model()`, which is why the API needs the exact same `s3-credentials` `Secret` MLflow does.
 - **A `kubernetes_secret` (`postgres-credentials`)** holding the raw Postgres user/password/db plus three pre-composed connection strings (`API_DATABASE_URL`, `MLFLOW_BACKEND_STORE_URI`, `PREFECT_DB_URL`) — every Deployment above reads its credentials via `secret_key_ref` instead of a literal `value`. MLflow's connection string lives inside a CLI arg rather than a discrete env var, so it's threaded through with Kubernetes' native `$(VAR_NAME)` command-substitution syntax instead.
 - **A self-signed TLS certificate (`hashicorp/tls` provider) + `kubernetes_ingress_v1`** fronting the API, MLflow, and Prefect UIs as name-based virtual hosts (`api.rossmann.local`, `mlflow.rossmann.local`, `prefect.rossmann.local`) through K3s' built-in Traefik ingress controller — added alongside the existing `LoadBalancer` Services, not instead of them, so nothing that already worked stops working.
 
@@ -354,22 +362,28 @@ resource "kubernetes_persistent_volume_claim" "postgres_data" {
 
 ## The Automation Scripts
 
-Eight deployment scripts, not four — because "tear everything down and rebuild" vs. "just get me back to a running state" are genuinely different operations with different risk profiles, **and** each of those two operations exists in two Docker-engine flavors: driven from Docker Desktop's Windows-side CLI, or driven from a Docker Engine installed natively inside the WSL2 Ubuntu distro (the `_wsl`-suffixed scripts). Same Kubernetes/Compose end state either way — only *where the `docker build`/`docker save` steps actually run* changes.
+Four deployment scripts, not eight — "tear everything down and rebuild" vs. "just get me back to a running state" are genuinely different operations with different risk profiles, for each of the two deploy paths (Compose, K3s). There used to be a second, Docker-Desktop-CLI-driven copy of each script too, but they were removed: LocalStack — required for MLflow/DVC's S3 storage, not optional (see below) — only ever runs inside WSL2 in this project, so every one of these four scripts already needs a working WSL2 Docker Engine regardless. A Docker-Desktop-only variant never actually avoided the WSL2 dependency, it just skipped the faster build path. **Docker Desktop is still required, but purely to view/monitor containers** — install it with WSL Integration enabled and use its Containers/Images dashboard to inspect whatever WSL2's own Docker Engine builds and runs; the *building and running* itself always happens through WSL2 now.
 
-| Script | Docker engine used | What it does |
-|---|---|---|
-| `scripts\deploy_k3s_clean.bat` | Docker Desktop (Windows-side CLI) | Destructive full rebuild. Resets WSL2, starts a fresh K3s server, pre-pulls base images into containerd, builds and imports all three custom images, deletes every prior K8s resource **including PVCs**, then runs `terraform init && terraform apply`. Use for a first deploy or a genuinely clean slate. |
-| `scripts\deploy_k3s_clean_wsl.bat` | Docker Engine installed natively inside WSL2 Ubuntu | Identical rebuild logic to the script above, except every `docker build`/`docker save` runs via `wsl bash -c "docker ..."` against Ubuntu's own Docker Engine instead of Docker Desktop's — faster, since the build context and image layers never cross the Windows↔WSL2 filesystem boundary. Starts the WSL Docker daemon automatically if it isn't already running, and fails with a clear error if Docker was never installed inside WSL at all. |
-| `scripts\deploy_k3s_reconcile.bat` | Docker Desktop (Windows-side CLI) | Non-destructive recovery. Checks whether K3s is already running before starting it. Individually checks every ConfigMap, PVC, Service, and Deployment the stack needs, and only runs `terraform apply` if something's actually missing. Restarts only the Deployments that fail a `rollout status` check. Never touches PVCs or existing state. |
-| `scripts\deploy_k3s_reconcile_wsl.bat` | Docker Engine installed natively inside WSL2 Ubuntu | Same non-destructive reconciliation as the script above; also verifies the WSL Docker daemon is up first, for consistency with the rest of the WSL-Docker script set (this particular script otherwise only talks to `k3s`/`kubectl` and Terraform directly, not `docker`). |
-| `scripts\deploy_compose_clean.bat` | Docker Desktop (Windows-side CLI) | Full Compose teardown (`down --volumes --rmi all --remove-orphans`) followed by a no-cache rebuild and `up -d --force-recreate`. |
-| `scripts\deploy_compose_clean_wsl.bat` | Docker Engine installed natively inside WSL2 Ubuntu | Same full teardown/rebuild, with every `docker compose` command run inside WSL2 against Ubuntu's own Docker Engine. Must be run **as Administrator** — it needs elevated rights to map the ports Compose opens inside WSL back to Windows `localhost`. |
-| `scripts\deploy_compose_reconcile.bat` | Docker Desktop (Windows-side CLI) | Validates the Compose file, then `up -d` — starts anything missing or stopped, leaves everything healthy alone. |
-| `scripts\deploy_compose_reconcile_wsl.bat` | Docker Engine installed natively inside WSL2 Ubuntu | Same validate-then-`up -d` reconciliation, run inside WSL2 against Ubuntu's own Docker Engine. Also requires **Administrator**, for the same localhost port-mapping reason as its clean counterpart. |
+| Script | What it does |
+|---|---|
+| `scripts\deploy_k3s_clean_wsl.bat` | Destructive full rebuild. Resets WSL2, starts a fresh K3s server, pre-pulls base images into containerd, builds and imports all three custom images (via WSL2's own Docker Engine), deletes every prior K8s resource **including PVCs**, then runs `terraform init && terraform apply`. Use for a first deploy or a genuinely clean slate. |
+| `scripts\deploy_k3s_reconcile_wsl.bat` | Non-destructive recovery. Checks whether K3s is already running before starting it. Individually checks every ConfigMap, PVC, Service, and Deployment the stack needs, and only runs `terraform apply` if something's actually missing. Restarts only the Deployments that fail a `rollout status` check. Never touches PVCs or existing state. |
+| `scripts\deploy_compose_clean_wsl.bat` | Full Compose teardown (`down --volumes --rmi all --remove-orphans`) followed by a no-cache rebuild and `up -d --force-recreate`, with every `docker compose` command run inside WSL2 against Ubuntu's own Docker Engine. Must be run **as Administrator** — it needs elevated rights to map the ports Compose opens inside WSL back to Windows `localhost`. |
+| `scripts\deploy_compose_reconcile_wsl.bat` | Validates the Compose file, then `up -d` — starts anything missing or stopped, leaves everything healthy alone. Also requires **Administrator**, for the same localhost port-mapping reason as its clean counterpart. |
 
-Both K3s scripts, in either Docker flavor, also invoke `scripts\install_terraform.sh` automatically — a standalone shell script rather than inline batch-file logic, for a reason explained in [Hard-Won Lessons](#hard-won-lessons).
+Both K3s scripts also invoke `scripts\install_terraform.sh` automatically — a standalone shell script rather than inline batch-file logic, for a reason explained in [Hard-Won Lessons](#hard-won-lessons).
 
-**Docker Desktop is required even if you only ever run the `_wsl` scripts.** K3s itself, and the plain (non-`_wsl`) scripts, still depend on it being installed with WSL Integration enabled; the `_wsl` variants just point the *build* steps at a second, independently-installed Docker Engine running inside Ubuntu for speed. Whichever engine actually built or is running a container, **Docker Desktop's own dashboard (Containers / Images tabs) can still be used to inspect and monitor it**, as long as WSL Integration stays enabled for that distro — you don't lose visibility by building through WSL instead of Docker Desktop.
+All four scripts also run `scripts\setup_localstack_bucket.sh` early on. It's a best-effort step: if [LocalStack](https://www.localstack.cloud/) is already running it's used as-is; if it's installed but stopped, the script starts it; if it isn't installed at all, or the AWS CLI is missing, the step just logs that and moves on **without failing the whole deploy** — but see below for why you actually want it installed, not skipped. When LocalStack is reachable, the script idempotently creates the two S3 **buckets** both DVC and MLflow need (`rossmann-mlops-dvc-store`, `rossmann-mlflow-artifacts`) — and that's *all* it creates. Neither DVC nor MLflow needs any "folder" (S3 prefix) pre-created inside those buckets: S3 has no real directory structure, a prefix simply starts existing the instant the first object is written under it, so `dvc push` and `mlflow.log_model()` create their own `dvc-store/...` / `mlflow-artifacts/...` layout automatically the first time each one actually runs. There's nothing else to provision, and nothing pre-creates empty folders that would just sit there unused.
+
+**Install LocalStack and the AWS CLI before your first deploy — this is a required prerequisite now, not an optional convenience.** Both buckets are load-bearing for the live containers themselves: MLflow's `mlflow`/`rossmann-api` Deployments write/read model artifacts straight to `s3://rossmann-mlflow-artifacts/...`, and `docker/entrypoint.sh`/`pipelines/training_pipeline.py` automatically configure and push DVC-tracked data to `s3://rossmann-mlops-dvc-store/...` on every training run (see [Hard-Won Lessons](#hard-won-lessons)). Skip this and the containers still start, but the first real training run fails loudly: `MLFLOW_S3_ENDPOINT_URL` is always set regardless (Terraform/Compose inject it unconditionally), so with no real LocalStack behind it, both MLflow's `log_model()` and the `dvc_push` task hit real connection errors instead of a graceful no-op — `dvc_push` in particular uses the same `check=True` hard-failure behavior as the other three pipeline stages once an endpoint is configured, it does not swallow real failures.
+
+Install both CLIs inside the WSL2 Ubuntu distro (not Windows — every script here runs LocalStack via `wsl bash`):
+
+```bash
+pip3 install localstack awscli
+```
+
+LocalStack itself then runs as a Docker container under the hood (`localstack start -d`), so it needs the same WSL2 Docker Engine from [Step 2](#prerequisites-windows--wsl2) below — nothing extra to install for that part. One caveat carried over from earlier hands-on debugging: LocalStack's own persistence feature is *not* enabled here (see [Known Limitations](#known-limitations)) — recreating the LocalStack container itself (not just restarting a deploy script) wipes both buckets, at which point `setup_localstack_bucket.sh` recreating two empty buckets is necessary but not sufficient; training has to actually run again to repopulate them.
 
 ---
 
@@ -434,6 +448,7 @@ Grouped by where the pain actually came from.
 - Neither the stock MLflow nor stock Prefect images ship a PostgreSQL driver. Pointing either at Postgres crashes immediately with a missing-module error. Fixed with two one-line custom Dockerfiles that add `psycopg2-binary` / `asyncpg` on top of the official base images.
 - Terraform's default behavior is to wait for a `PersistentVolumeClaim` to reach `Bound` before proceeding — but K3s' local-path provisioner only binds a volume once a pod that *uses* the claim gets scheduled, which can't happen while Terraform is still blocked waiting on the PVC. A real deadlock. Fixed with `wait_until_bound = false` on every PVC.
 - `docker-entrypoint-initdb.d` scripts run exactly once, against a completely empty data directory. On any redeploy against an existing volume, newly-added `CREATE DATABASE` statements silently never execute, and dependent services fail with "database does not exist." Fixed with `app/db_bootstrap.py` — an idempotent check-then-create step that runs on every API container start, not just the first.
+- The `deploy_k3s_clean*.bat` scripts wipe `terraform.tfstate` and then manually `kubectl delete` a hardcoded list of resources before re-applying — but `wsl --shutdown` doesn't actually clear K3s's persisted cluster data, only WSL subsystem state, so any resource *not* in that list (like the `Secret`/`Ingress` added later) survives as an orphan the freshly-wiped Terraform state no longer tracks, and the next `terraform apply` fails with "already exists." Fixed by keeping that delete list in sync with `main.tf`'s actual resources.
 
 **Windows & WSL2 tooling**
 
@@ -448,6 +463,19 @@ Grouped by where the pain actually came from.
 - Postgres columns are lowercase (`stateholiday`, `dayofweek`); the model was trained on PascalCase feature names. Fixed with one consistent rename map applied at every ingestion, training, and inference boundary — including the real-time Feast path.
 - Feature-order mismatches produce plausible-looking but wrong predictions instead of an error. The batch path explicitly slices and reorders columns into the exact training-time order before calling `.predict()`, and logs a warning if an entire batch comes back as a single repeated value.
 - Evidently's 0.7 release restructured the report schema `drift.py` depends on. Rather than get surprised by it, `requirements.txt` pins an explicit upper bound with an inline comment explaining why.
+
+**Python dependency pinning**
+
+- `aiobotocore` (pulled in transitively by `dvc[s3]`'s `dvc-s3` plugin) re-pins a different, narrow `botocore` version range on almost every release, while `dvc[s3]` itself left that whole chain unbounded. On a *fresh* install — every `docker build`, since the image has no pre-existing site-packages to short-circuit resolution against — pip's resolver tries dozens of `aiobotocore` releases, downloading a fresh ~14.6MB `botocore` wheel per attempt, looking like it hangs forever. Fixed by pinning the entire verified-working chain explicitly: `dvc[s3]==3.67.1`, `dvc-s3==3.3.0`, `aiobotocore==2.26.0`, `botocore>=1.41.0,<1.41.6`.
+- `docker/prefect.Dockerfile` pins the **server** to Prefect 2.14, but `requirements.txt` originally left the **client** (API image) floating on `>=2.14.0,<3.0.0` — which resolved to 2.20.x, six minor versions ahead. The newer client's deployment-creation payload includes fields (`paused`, `schedules`) the older server's API schema rejects outright with a `422 Unprocessable Entity`, breaking `pipelines/serve_deployment.py`'s `flow.serve()`. Pinning the client back to `<2.15.0` to match then surfaced a second, previously-hidden problem: Prefect 2.14's own code imports `griffe.dataclasses`, a module a later `griffe` major release removed entirely — fixed with an explicit `griffe<1.0.0`. Both fixes were verified live against a running K3s deployment, not just locally.
+- `docker/api.Dockerfile` used to `COPY .dvc/ .dvc/` wholesale, which — since no `.dockerignore` excludes it — silently baked the gitignored, host-only `.dvc/config.local` (LocalStack endpoint + dummy credentials) into the image. Harmless but pointless: `127.0.0.1` inside a container's own network namespace refers to *that container*, not the WSL host LocalStack actually listens on, so the copied-in override could never resolve (verified live — a container-side request to it raises `ConnectionRefusedError`). Fixed to `COPY .dvc/config .dvc/config`, copying only the real, portable, committed remote pointer.
+
+**MLflow / S3 artifact migration**
+
+- `dvc repro` (the command every pipeline stage runs) never talks to a remote at all — it only reads/writes the local `.dvc/cache`. Getting data into S3 needs a separate, explicit `dvc push`, unlike MLflow's `log_model()`, which writes to its configured artifact store synchronously as part of the same call. Easy to miss because nothing errors without it — DVC's own CLI output even prints a "Use `dvc push` to send your updates to remote storage" hint after every `repro`, which is easy to read as informational rather than as a to-do. Fixed by adding a 4th Prefect task (`dvc_push`) to `pipelines/training_pipeline.py`, run after `dvc_train` on every pipeline execution.
+- The committed `.dvc/config` intentionally has no endpoint override (so it stays portable to real AWS), which meant DVC's S3 remote had no working endpoint *inside a container* at all — `.dvc/config.local` (the correct place for that) was deliberately kept out of the image for the exact reason in the entry above about `127.0.0.1`. Fixed by generating `.dvc/config.local` dynamically in `docker/entrypoint.sh` at every container boot, via `dvc remote modify --local`, reusing the exact same `MLFLOW_S3_ENDPOINT_URL`/`AWS_*` env vars already injected for MLflow — no new Secret, no baked-in machine-specific file, and it degrades gracefully (skips entirely) if those env vars aren't set.
+- LocalStack (used for local S3 testing) defaults to binding port `4566` on `127.0.0.1` only — the same class of bug as the MLflow one above, just one network hop further out: not even the K3s node's own real IP could reach it, because a `127.0.0.1`-only bind means only *that same network namespace* can connect, and a K3s pod's namespace is never the WSL host's. Verified live with two separate `ConnectionRefusedError`s (via `127.0.0.1` and via the node IP) before the fix. Fixed by recreating the container with `-p 4566:4566` (all interfaces) instead of `-p 127.0.0.1:4566:4566`. Trade-off discovered the hard way: LocalStack's own persistence feature was never actually turned on (its `/_localstack/health` endpoint reported `"persistence": "disabled"` the whole time), so recreating the container wiped every bucket that existed under the old binding — worth confirming persistence is genuinely on before relying on a LocalStack container surviving a recreate.
+- MLflow records each experiment's `artifact_location` once, at experiment-creation time, and never revisits it — pointing the *server's* `--default-artifact-root` at a new S3 bucket does nothing for experiments that already existed beforehand. `src/train.py`'s `mlflow.set_experiment("Rossmann_Sales_Forecasting")` kept resolving to its original local PVC path even after the server-wide default moved to S3 — training kept "succeeding" the entire time, with no error or warning, just artifacts silently continuing to land in the old location. Verified live via the run's own recorded `artifact_uri` (still `/mlflow/artifacts/...`, not `s3://...`, immediately after the migration). Fixed by renaming to a new experiment (`Rossmann_Sales_Forecasting_v2`), which — never having existed before — correctly inherits the server's current artifact root on first use. The old experiment and its run/model history are untouched, just no longer written to.
 
 **Secrets, config & scheduling**
 
@@ -525,7 +553,13 @@ echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://
 sudo apt-get update && sudo apt-get install terraform
 ```
 
-...or skip this step entirely — `scripts\install_terraform.sh` handles it automatically (via a direct binary download rather than the apt route) every time `deploy_k3s_clean.bat` or `deploy_k3s_reconcile.bat` runs, and does nothing if Terraform is already installed.
+...or skip this step entirely — `scripts\install_terraform.sh` handles it automatically (via a direct binary download rather than the apt route) every time either K3s script runs, and does nothing if Terraform is already installed.
+
+Finally, install LocalStack and the AWS CLI — required, not optional, since MLflow and DVC both depend on a real S3 endpoint existing (see [The Automation Scripts](#the-automation-scripts) for exactly why skipping this makes training fail):
+
+```bash
+pip3 install localstack awscli
+```
 
 > Reference Python version: the API image and CI both pin **Python 3.9** — match it locally if you're running anything outside a container.
 
@@ -536,24 +570,22 @@ sudo apt-get update && sudo apt-get install terraform
 ```bash
 git clone https://github.com/benkeddad/mlops-demand-forecast.git
 cd mlops-demand-forecast
-scripts\deploy_compose_clean.bat        :: first run / full rebuild
-scripts\deploy_compose_reconcile.bat    :: subsequent runs
+scripts\deploy_compose_clean_wsl.bat        :: first run / full rebuild
+scripts\deploy_compose_reconcile_wsl.bat    :: subsequent runs
 ```
 
-Once healthy: API docs at `http://localhost:8000/docs`, MLflow at `http://localhost:5000`, Prefect at `http://localhost:4200`, Postgres at `localhost:5432`.
-
-Have Docker installed natively inside WSL2 as well (see [Prerequisites](#prerequisites-windows--wsl2) above)? Swap in the `_wsl` variants for faster builds — `scripts\deploy_compose_clean_wsl.bat` / `scripts\deploy_compose_reconcile_wsl.bat` — both run **as Administrator** (right-click → Run as administrator), since they need elevated rights to map WSL's ports back to Windows `localhost`.
+Both run **as Administrator** (right-click → Run as administrator) — they need elevated rights to map WSL's ports back to Windows `localhost`. Once healthy: API docs at `http://localhost:8000/docs`, MLflow at `http://localhost:5000`, Prefect at `http://localhost:4200`, Postgres at `localhost:5432`.
 
 **Terraform + K3s — production-shaped runtime:**
 
 After the prerequisites above, with Docker Desktop running, right-click and **Run as Administrator**:
 
 ```bat
-scripts\deploy_k3s_clean.bat        :: first deploy / clean slate
-scripts\deploy_k3s_reconcile.bat    :: subsequent runs / recovery
+scripts\deploy_k3s_clean_wsl.bat        :: first deploy / clean slate
+scripts\deploy_k3s_reconcile_wsl.bat    :: subsequent runs / recovery
 ```
 
-Either script opens four live log/port-forward windows for the API, MLflow, Prefect, and Postgres when it finishes. Same WSL-Docker prerequisite as above? Use `scripts\deploy_k3s_clean_wsl.bat` / `scripts\deploy_k3s_reconcile_wsl.bat` instead — the only difference is where the three custom images get built.
+Either script opens four live log/port-forward windows for the API, MLflow, Prefect, and Postgres when it finishes. Both scripts build images through WSL2's own Docker Engine; Docker Desktop only needs to be running so its dashboard can show you what's built/running — it doesn't do the building itself.
 
 ---
 
@@ -612,10 +644,10 @@ Deliberate shortcuts, flagged explicitly rather than left for someone else to di
 
 - Postgres credentials now live in a Kubernetes `Secret` (Terraform) and a gitignored `deploy/.env` (Compose) instead of being hardcoded in `main.tf`/`docker-compose.yaml` — but the *default* values in both are still the same well-known demo password (`user`/`Password`), and `feature_repo/feature_store.yaml`'s Feast config still hardcodes them directly. None of this comes from a real secrets manager (Vault, AWS Secrets Manager, etc.) — a real deployment must override `terraform.tfvars`/`deploy/.env` with its own values.
 - The Kubernetes Ingress in front of the stack terminates TLS with a **self-signed certificate** generated by Terraform (`tls_self_signed_cert`) — fine for a demo, but browsers/clients will flag it, and there's still no authentication in front of the ingress or the `/trigger-training` endpoint. Every `Service` also remains `type: LoadBalancer` alongside the new Ingress, so the original direct-port access pattern (`localhost:8000`, etc.) keeps working unchanged.
-- MLflow, Prefect, and Feast's registry each have their own Postgres database, but all four databases live on the **same single Postgres instance** — one outage takes down data, tracking, orchestration, and feature metadata together. MLflow's model artifacts also sit on a single PVC rather than an object store, which won't scale past one node.
+- MLflow, Prefect, and Feast's registry each have their own Postgres database, but all four databases live on the **same single Postgres instance** — one outage takes down data, tracking, orchestration, and feature metadata together. MLflow's model artifacts now live in an S3-compatible bucket (LocalStack) instead of a PVC, but that bucket is itself one LocalStack container with persistence disabled — recreating it (or a host reboot that cycles the container) loses every artifact, and the `localstack_endpoint` Terraform variable is a hardcoded K3s node IP that silently goes stale if that address ever changes. Pre-migration model versions also remain reachable only through the old PVC path, not S3 — there was no retroactive artifact migration, only a cutover for new experiments (see [Hard-Won Lessons](#hard-won-lessons)).
 - Training now runs as a real Prefect Deployment (`pipelines/serve_deployment.py`, triggered via `run_deployment(...)`) instead of an ad-hoc `subprocess` call, but the deployment server itself is still just a second subprocess launched by the API process (via `flow.serve()`), not a dedicated worker behind a work pool — it goes down with the API container and doesn't scale independently of it.
 - `monitoring/drift.py`'s `--fail-on-drift` flag is now exercised by a real scheduled job (`.github/workflows/drift-monitoring.yml`), but that job runs against a throwaway, freshly-seeded Postgres container in CI, not the actual deployed stack — wiring its `RETRAIN_TRIGGER_URL` to a real, reachable, *authenticated* deployment is still left to whoever deploys this for real.
-- The DVC S3 remote (`.dvc/config`) points at a placeholder bucket name (`rossmann-mlops-dvc-store`) that doesn't exist anywhere — `dvc remote modify storage url s3://<your-bucket>/dvc-store` plus standard AWS credentials (env vars or `~/.aws/credentials`) are required before `dvc push`/`dvc pull` actually work against a real bucket.
+- The DVC S3 remote (`.dvc/config`) points at bucket name `rossmann-mlops-dvc-store`, which doesn't exist on real AWS. `scripts\setup_localstack_bucket.sh` (see [The Automation Scripts](#the-automation-scripts)) creates that same bucket inside **LocalStack** for local dev/testing; both the host shell (via a manually-run `dvc remote modify --local`) and every running container (via `docker/entrypoint.sh`, automatically, on every boot) layer the LocalStack endpoint/dummy credentials on top of the committed config the same way — through `.dvc/config.local`, never the committed `.dvc/config` itself. Pointing this at real AWS instead still requires `dvc remote modify storage url s3://<your-bucket>/dvc-store` plus real AWS credentials, and removing the LocalStack-only overrides in `config.local`.
 
 ---
 
@@ -629,6 +661,7 @@ Recently closed out (see [Known Limitations](#known-limitations) above for the h
 - [x] A real scheduled/deployed Prefect flow run ([`pipelines/serve_deployment.py`](pipelines/serve_deployment.py) + `run_deployment(...)`) instead of the ad-hoc `subprocess` trigger
 - [x] Ingress + TLS in front of the Kubernetes services (K3s' built-in Traefik + a self-signed cert)
 - [x] `monitoring/drift.py` now runs on a schedule via [`.github/workflows/drift-monitoring.yml`](.github/workflows/drift-monitoring.yml)
+- [x] MLflow model artifacts moved off the shared PVC and onto an S3-compatible bucket (LocalStack) — see [Infrastructure as Code](#infrastructure-as-code) and the caveats in [Known Limitations](#known-limitations)
 
 Still open:
 

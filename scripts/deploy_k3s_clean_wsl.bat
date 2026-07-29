@@ -6,7 +6,10 @@
 setlocal enabledelayedexpansion
 cd /d "%~dp0.."
 
-:: WSL-Docker variant of deploy_k3s_clean.bat: identical logic, except the
+:: Destructive full K3s rebuild, with image builds run against the Docker
+:: Engine installed inside the WSL Ubuntu distro (not Docker Desktop's own
+:: engine). The only supported clean-K3s script - LocalStack (needed for S3)
+:: only runs inside WSL anyway, so a Docker-Desktop-only variant added nothing.
 :: custom image builds run against the Docker Engine installed inside the
 :: WSL Ubuntu distro (faster) instead of Docker Desktop.
 

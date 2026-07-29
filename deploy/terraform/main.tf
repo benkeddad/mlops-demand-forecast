@@ -70,6 +70,63 @@ resource "kubernetes_secret" "postgres_credentials" {
   type = "Opaque"
 }
 
+# Claude added: LocalStack's S3 endpoint reachable from INSIDE the cluster is
+# different from the host-side one (http://127.0.0.1:4566) .dvc/config.local
+# uses - pods have their own network namespace and can't reach the WSL host's
+# loopback-bound services, only the K3s node's real IP (confirmed: LocalStack
+# itself publishes 127.0.0.1:4566 only, and even the node's own IP only works
+# once that publish is changed to 0.0.0.0). This is inherently a single-node,
+# local-dev-only value with no portable way to auto-discover it generically -
+# a variable with a default matching this machine's current node IP, override
+# via terraform.tfvars if it ever changes (e.g. after a WSL/Docker restart
+# re-assigns the node's IP).
+variable "localstack_endpoint" {
+  description = "LocalStack S3 endpoint reachable from inside the K3s cluster (node IP, not 127.0.0.1)."
+  type        = string
+  default     = "http://10.21.36.158:4566"
+}
+
+# Override via terraform.tfvars or TF_VAR_aws_access_key_id / TF_VAR_aws_secret_access_key
+# for a real deployment - LocalStack ignores the actual values (any non-empty
+# string works), so "test"/"test" are safe, portable defaults for local dev.
+variable "aws_access_key_id" {
+  description = "AWS/S3 access key - dummy value for LocalStack, real key for actual AWS."
+  type        = string
+  default     = "test"
+}
+
+variable "aws_secret_access_key" {
+  description = "AWS/S3 secret key - dummy value for LocalStack, real key for actual AWS."
+  type        = string
+  default     = "test"
+  sensitive   = true
+}
+
+variable "aws_default_region" {
+  description = "AWS/S3 region."
+  type        = string
+  default     = "us-east-1"
+}
+
+# NEW: MLflow's artifact store (models, not run metadata - that's still
+# Postgres via MLFLOW_BACKEND_STORE_URI above) now lives in S3 instead of a
+# PersistentVolumeClaim. Both MLflow (writing) and the API
+# (mlflow.pyfunc.load_model reading) need these same four values.
+resource "kubernetes_secret" "s3_credentials" {
+  metadata {
+    name = "s3-credentials"
+  }
+
+  data = {
+    MLFLOW_S3_ENDPOINT_URL = var.localstack_endpoint
+    AWS_ACCESS_KEY_ID      = var.aws_access_key_id
+    AWS_SECRET_ACCESS_KEY  = var.aws_secret_access_key
+    AWS_DEFAULT_REGION     = var.aws_default_region
+  }
+
+  type = "Opaque"
+}
+
 #Step 2: The PostgreSQL & Redis Backend
 # 1. ConfigMap to hold your database structure script
 resource "kubernetes_config_map" "postgres_init" {
@@ -341,12 +398,52 @@ resource "kubernetes_deployment" "mlflow" {
             }
           }
 
+          # NEW: S3-compatible artifact store credentials (LocalStack for
+          # local dev) - MLflow's boto3-based S3ArtifactRepository reads
+          # MLFLOW_S3_ENDPOINT_URL/AWS_* directly from the environment.
+          env {
+            name = "MLFLOW_S3_ENDPOINT_URL"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.s3_credentials.metadata[0].name
+                key  = "MLFLOW_S3_ENDPOINT_URL"
+              }
+            }
+          }
+          env {
+            name = "AWS_ACCESS_KEY_ID"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.s3_credentials.metadata[0].name
+                key  = "AWS_ACCESS_KEY_ID"
+              }
+            }
+          }
+          env {
+            name = "AWS_SECRET_ACCESS_KEY"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.s3_credentials.metadata[0].name
+                key  = "AWS_SECRET_ACCESS_KEY"
+              }
+            }
+          }
+          env {
+            name = "AWS_DEFAULT_REGION"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.s3_credentials.metadata[0].name
+                key  = "AWS_DEFAULT_REGION"
+              }
+            }
+          }
+
           args = [
             "mlflow", "server",
             "--host", "0.0.0.0",
             "--port", "5000",
             "--backend-store-uri", "$(MLFLOW_BACKEND_STORE_URI)",
-            "--default-artifact-root", "/mlflow/artifacts",
+            "--default-artifact-root", "s3://rossmann-mlflow-artifacts/mlflow-artifacts",
             "--allowed-hosts", "*"
           ]
 
@@ -565,6 +662,68 @@ resource "kubernetes_deployment" "api" {
           env {
             name  = "WATCHFILES_FORCE_POLLING"
             value = "true"
+          }
+
+          # NEW: raw (not pre-composed) Postgres creds - feature_repo/feature_store.yaml's
+          # ${POSTGRES_USER}/${POSTGRES_PASSWORD} placeholders get substituted from these
+          # by docker/entrypoint.sh at boot (Feast has no native env-var substitution).
+          env {
+            name = "POSTGRES_USER"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.postgres_credentials.metadata[0].name
+                key  = "POSTGRES_USER"
+              }
+            }
+          }
+          env {
+            name = "POSTGRES_PASSWORD"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.postgres_credentials.metadata[0].name
+                key  = "POSTGRES_PASSWORD"
+              }
+            }
+          }
+
+          # NEW: same S3/LocalStack credentials as MLflow - mlflow.pyfunc.load_model()
+          # resolves a models:/... URI into a real s3://... artifact path via the
+          # tracking server, then downloads it client-side using these.
+          env {
+            name = "MLFLOW_S3_ENDPOINT_URL"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.s3_credentials.metadata[0].name
+                key  = "MLFLOW_S3_ENDPOINT_URL"
+              }
+            }
+          }
+          env {
+            name = "AWS_ACCESS_KEY_ID"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.s3_credentials.metadata[0].name
+                key  = "AWS_ACCESS_KEY_ID"
+              }
+            }
+          }
+          env {
+            name = "AWS_SECRET_ACCESS_KEY"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.s3_credentials.metadata[0].name
+                key  = "AWS_SECRET_ACCESS_KEY"
+              }
+            }
+          }
+          env {
+            name = "AWS_DEFAULT_REGION"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.s3_credentials.metadata[0].name
+                key  = "AWS_DEFAULT_REGION"
+              }
+            }
           }
 
           # Mount the shared MLflow volume so the API can read the model artifacts

@@ -4,7 +4,10 @@ setlocal enabledelayedexpansion
 :: This script lives in scripts\, so move to the repository root.
 cd /d "%~dp0.."
 
-:: WSL-Docker variant of scriptsdeploy_compose_reconcile.bat: identical logic,
+:: Non-destructive Compose reconciliation, run against the Docker Engine
+:: installed inside the WSL Ubuntu distro (not Docker Desktop's own engine).
+:: The only supported reconcile-Compose script - LocalStack (needed for S3)
+:: only runs inside WSL anyway, so a Docker-Desktop-only variant added nothing.
 :: except every Docker / Docker Compose command runs against the Docker
 :: Engine installed inside the WSL Ubuntu distro (faster) instead of Docker
 :: Desktop.

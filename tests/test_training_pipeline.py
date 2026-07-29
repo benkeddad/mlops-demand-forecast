@@ -3,6 +3,7 @@ from unittest.mock import patch
 from pipelines.training_pipeline import (
     dvc_featurize,
     dvc_ingest,
+    dvc_push,
     dvc_train,
     ml_training_pipeline,
 )
@@ -37,3 +38,19 @@ def test_train_stage_runs_plain_dvc_repro():
     args, kwargs = mock_run.call_args
     assert args[0] == ["dvc", "repro", "train"]
     assert kwargs["check"] is True
+
+
+def test_push_stage_runs_dvc_push_when_s3_endpoint_configured():
+    with patch.dict("os.environ", {"MLFLOW_S3_ENDPOINT_URL": "http://localstack:4566"}):
+        with patch("pipelines.training_pipeline.subprocess.run") as mock_run:
+            dvc_push.fn()
+    args, kwargs = mock_run.call_args
+    assert args[0] == ["dvc", "push"]
+    assert kwargs["check"] is True
+
+
+def test_push_stage_skips_dvc_push_without_s3_endpoint():
+    with patch.dict("os.environ", {}, clear=True):
+        with patch("pipelines.training_pipeline.subprocess.run") as mock_run:
+            dvc_push.fn()
+    mock_run.assert_not_called()

@@ -53,12 +53,22 @@ services:
       - "5000:5000"
     volumes:
       - mlflow_data:/mlflow
+    # NEW: host.docker.internal lets this container reach LocalStack running
+    # on the host/WSL side (127.0.0.1:4566 there) without hardcoding an IP -
+    # portable across machines, unlike the K3s path's node-IP variable.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - MLFLOW_S3_ENDPOINT_URL=http://host.docker.internal:4566
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
     command: >
       mlflow server
         --host 0.0.0.0
         --port 5000
         --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/mlflow
-        --default-artifact-root /mlflow/artifacts
+        --default-artifact-root s3://rossmann-mlflow-artifacts/mlflow-artifacts
         --allowed-hosts "*"
     # CHANGED: Require postgres to start first, and restart if connection fails initially
     # Claude modified this block: switched to the same health-gated condition prefect already
@@ -115,10 +125,24 @@ services:
     working_dir: /app
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/rossmann
+      # NEW: raw (not pre-composed) Postgres creds - feature_repo/feature_store.yaml
+      # uses ${POSTGRES_USER}/${POSTGRES_PASSWORD} substitution (a Feast-native
+      # feature), which needs these as real env vars, not just folded into DATABASE_URL.
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - MODEL_URI=models:/Rossmann_XGBoost_Model/latest
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - PREFECT_API_URL=http://prefect:4200/api
       - WATCHFILES_FORCE_POLLING=true
+      # NEW: same S3/LocalStack credentials as mlflow - mlflow.pyfunc.load_model()
+      # resolves a models:/... URI into a real s3://... artifact path via the
+      # tracking server, then downloads it client-side using these.
+      - MLFLOW_S3_ENDPOINT_URL=http://host.docker.internal:4566
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - postgres
       - redis
