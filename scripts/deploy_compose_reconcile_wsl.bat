@@ -8,9 +8,6 @@ cd /d "%~dp0.."
 :: installed inside the WSL Ubuntu distro (not Docker Desktop's own engine).
 :: The only supported reconcile-Compose script - LocalStack (needed for S3)
 :: only runs inside WSL anyway, so a Docker-Desktop-only variant added nothing.
-:: except every Docker / Docker Compose command runs against the Docker
-:: Engine installed inside the WSL Ubuntu distro (faster) instead of Docker
-:: Desktop.
 
 echo =======================================================
 echo   Checking Docker Engine inside WSL Ubuntu
@@ -52,15 +49,6 @@ if errorlevel 1 (
 )
 
 echo Docker Engine and Compose were found inside WSL. Using them instead of Docker Desktop.
-echo.
-
-echo =======================================================
-echo   Checking LocalStack (S3) for DVC Remote Storage
-echo =======================================================
-echo.
-
-wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
-
 echo.
 
 echo =======================================================
@@ -115,6 +103,14 @@ echo Current service status:
 call wsl -u root bash -c "cd $(wslpath '%CD%') && docker compose -f deploy/docker-compose.yaml ps"
 
 echo.
+echo =======================================================
+echo   Checking LocalStack (S3) for DVC Remote Storage
+echo =======================================================
+echo.
+
+wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
+
+echo.
 echo ===================================================
 echo   Mapping Windows localhost to the WSL Docker containers
 echo ===================================================
@@ -126,7 +122,7 @@ if not defined WSL_IP (echo ERROR: Unable to resolve the WSL IP address. & pause
 
 echo WSL IP address: %WSL_IP%
 
-for %%P in (8000 5000 4200 5432 6379) do (netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=%%P >nul 2>&1 & netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=%%P connectaddress=%WSL_IP% connectport=%%P >nul)
+for %%P in (8000 5000 4200 5432 6379 4566) do (netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=%%P >nul 2>&1 & netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=%%P connectaddress=%WSL_IP% connectport=%%P >nul)
 
 echo All ports mapped from Windows localhost to WSL IP %WSL_IP%.
 echo.

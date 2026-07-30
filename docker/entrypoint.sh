@@ -73,6 +73,23 @@ if [ -n "$MLFLOW_S3_ENDPOINT_URL" ]; then
     dvc remote modify --local storage access_key_id "$AWS_ACCESS_KEY_ID"
     dvc remote modify --local storage secret_access_key "$AWS_SECRET_ACCESS_KEY"
     dvc remote modify --local storage use_ssl false
+
+    # LocalStack has no persistence - if its pod ever gets recreated outside
+    # the deploy scripts (crash-loop, manual restart, etc.), both buckets
+    # vanish and training fails with NoSuchBucket. Self-heal on every boot
+    # instead of only relying on scripts/setup_localstack_bucket.sh.
+    python3 -c "
+import boto3
+from botocore.exceptions import ClientError
+s3 = boto3.client('s3', endpoint_url='$MLFLOW_S3_ENDPOINT_URL')
+for bucket, prefix in [('rossmann-mlops-dvc-store', 'dvc-store'), ('rossmann-mlflow-artifacts', 'mlflow-artifacts')]:
+    try:
+        s3.head_bucket(Bucket=bucket)
+    except ClientError:
+        s3.create_bucket(Bucket=bucket)
+        print(f'Created S3 bucket {bucket}')
+    s3.put_object(Bucket=bucket, Key=f'{prefix}/')
+"
 fi
 # -----------------------
 

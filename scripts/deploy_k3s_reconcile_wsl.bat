@@ -44,13 +44,23 @@ if errorlevel 1 (
 
 echo Docker Engine was found inside WSL. Using it instead of Docker Desktop.
 echo.
-
 echo =======================================================
-echo   Checking LocalStack (S3) for DVC Remote Storage
+echo   Checking Administrator Privileges
 echo =======================================================
 echo.
 
-wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
+net session >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: This script must be run as Administrator so it can map LocalStack's port to Windows localhost.
+    echo Right-click this script and choose "Run as administrator", then run it again.
+    pause
+    exit /b 1
+)
+
+echo Administrator privileges confirmed.
+echo.
+echo Ensuring LocalStack 4.4.0 image is cached in k3s...
+wsl -u root k3s ctr -n k8s.io images pull docker.io/localstack/localstack:4.4.0
 
 echo.
 
@@ -305,6 +315,16 @@ if errorlevel 1 (
     echo OK: deployment/rossmann-api
 )
 
+echo Checking Deployment localstack...
+wsl -u root k3s kubectl get deployment localstack >nul 2>&1
+
+if errorlevel 1 (
+    echo MISSING: deployment/localstack
+    set "NEED_TERRAFORM_APPLY=1"
+) else (
+    echo OK: deployment/localstack
+)
+
 echo.
 
 if "!NEED_TERRAFORM_APPLY!"=="1" (
@@ -475,7 +495,49 @@ if errorlevel 1 (
 )
 
 echo.
+echo Checking LocalStack deployment...
+
+wsl -u root k3s kubectl rollout status deployment/localstack --timeout=10s >nul 2>&1
+
+if errorlevel 1 (
+    echo LocalStack is not healthy. Restarting deployment/localstack...
+
+    wsl -u root k3s kubectl rollout restart deployment/localstack
+
+    if errorlevel 1 (
+        echo ERROR: LocalStack restart command failed.
+        pause
+        exit /b 1
+    )
+
+    wsl -u root k3s kubectl rollout status deployment/localstack --timeout=120s
+
+    if errorlevel 1 (
+        echo ERROR: LocalStack did not become ready after restart.
+        echo.
+        wsl -u root k3s kubectl get pods
+        pause
+        exit /b 1
+    )
+) else (
+    echo LocalStack is healthy. Skipping restart.
+)
+
+echo.
 echo All deployments are available.
+
+:: kubectl port-forward is flaky (silently drops, needs reconnect loops) -
+:: netsh maps Windows localhost straight to the node's real IP instead,
+:: the same stable mechanism the Compose scripts already use.
+netsh interface portproxy delete v4tov4 listenaddress=127.0.0.1 listenport=4566 >nul 2>&1
+netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=4566 connectaddress=10.21.36.158 connectport=4566 >nul
+
+echo =======================================================
+echo   Checking LocalStack (S3) for DVC Remote Storage
+echo =======================================================
+echo.
+
+wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
 
 echo =======================================================
 echo   [6/6] Launching Interfaces and Live Logs
@@ -497,6 +559,8 @@ start "Prefect Orchestration Console" wsl -u root bash -c "(while true; do k3s k
 
 start "PostgreSQL Database Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/postgres 5432:5432 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/postgres; sleep 2; done"
 
+start "LocalStack Console" wsl -u root k3s kubectl logs -f deployment/localstack
+
 echo.
 echo =======================================================
 echo   Recovery Startup Complete
@@ -508,6 +572,7 @@ echo   API Dashboard:    http://localhost:8000
 echo   MLflow Dashboard: http://localhost:5000
 echo   Prefect Portal:   http://localhost:4200
 echo   Database Access:  localhost:5432
+echo   LocalStack (S3):  localhost:4566
 echo =======================================================
 
 pause

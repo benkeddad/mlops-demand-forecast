@@ -7,7 +7,7 @@ entity_key_serialization_version: 2
 # Feast's startup warning about which SQLAlchemy driver it defaults to.
 registry:
   registry_type: sql
-  path: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/feast
+  path: postgresql+psycopg://user:Password@postgres:5432/feast
 
 offline_store:
   type: postgres
@@ -15,8 +15,8 @@ offline_store:
   port: 5432
   database: rossmann
   db_schema: public
-  user: ${POSTGRES_USER}
-  password: ${POSTGRES_PASSWORD}
+  user: user
+  password: Password
   sslmode: disable
 
 online_store:

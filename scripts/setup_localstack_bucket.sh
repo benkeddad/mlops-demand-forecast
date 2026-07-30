@@ -12,22 +12,26 @@
 # artifact storage, via `--default-artifact-root s3://...`) something real
 # to talk to when LocalStack happens to be available.
 #
+# LocalStack itself is no longer started here - both deploy paths now bring
+# it up declaratively before this script ever runs (a Compose service with
+# its own healthcheck, or a Terraform-managed k3s Deployment/Service), so
+# this only ever needs to check whether it's actually responding.
+#
 # Behavior:
-#   1. If LocalStack is already running (127.0.0.1:4566 healthy) - use it.
-#   2. Else, if the `localstack` CLI is installed - start it and wait for
-#      it to become healthy.
-#   3. Else - LocalStack isn't installed; skip entirely, no error. DVC/MLflow
-#      will just use their local cache/volume instead of S3.
-#   4. If LocalStack ends up reachable AND the `aws` CLI is installed,
-#      idempotently create every bucket below.
-#   5. If the `aws` CLI isn't installed, skip bucket creation, no error.
+#   1. If LocalStack is reachable (127.0.0.1:4566 healthy) - create buckets.
+#   2. Else - skip entirely, no error. DVC/MLflow just use their local
+#      cache/volume instead of S3.
+#   3. If the `aws` CLI isn't installed, skip bucket creation, no error.
 #
 # Always exits 0 - none of the above blocks the rest of the deploy scripts.
 
 # .dvc/config's remote name/region (DVC) and deploy/terraform's
 # --default-artifact-root / docker-compose.yaml's mlflow command (MLflow)
-# must match these exactly.
+# must match these exactly. Each bucket's own prefix goes with it, so both
+# get pre-created as an explicit empty "folder" marker (not required for S3
+# itself, but MLflow/DVC don't have to be the ones to create it first).
 BUCKETS=("rossmann-mlops-dvc-store" "rossmann-mlflow-artifacts")
+PREFIXES=("dvc-store" "mlflow-artifacts")
 ENDPOINT="http://127.0.0.1:4566"
 
 localstack_healthy() {
@@ -36,29 +40,23 @@ localstack_healthy() {
 
 echo "Checking LocalStack (S3) at $ENDPOINT ..."
 
-if localstack_healthy; then
-    echo "LocalStack is already running."
-elif command -v localstack >/dev/null 2>&1; then
-    echo "LocalStack is installed but not running - starting it..."
-    localstack start -d >/dev/null 2>&1
-
-    for i in $(seq 1 20); do
-        if localstack_healthy; then
-            break
-        fi
-        sleep 3
-    done
-
+# A few retries, not a hard requirement to start anything: on k3s, the port
+# to $ENDPOINT is a `kubectl port-forward` tunnel that can take a moment to
+# establish even after the pod itself is confirmed ready.
+LOCALSTACK_READY=0
+for i in $(seq 1 10); do
     if localstack_healthy; then
-        echo "LocalStack started successfully."
-    else
-        echo "LocalStack did not become healthy in time - skipping S3 bucket setup."
-        echo "DVC will fall back to its local cache/volume."
-        exit 0
+        LOCALSTACK_READY=1
+        break
     fi
+    sleep 2
+done
+
+if [ "$LOCALSTACK_READY" = "1" ]; then
+    echo "LocalStack is reachable."
 else
-    echo "LocalStack is not installed - skipping S3 bucket setup."
-    echo "DVC will fall back to its local cache/volume."
+    echo "LocalStack is not reachable - skipping S3 bucket setup."
+    echo "DVC/MLflow will fall back to their local cache/volume."
     exit 0
 fi
 
@@ -79,6 +77,18 @@ for BUCKET in "${BUCKETS[@]}"; do
         echo "Created S3 bucket '$BUCKET' in LocalStack."
     else
         echo "Could not create S3 bucket '$BUCKET' - falling back to local cache/volume for it."
+    fi
+done
+
+for i in "${!BUCKETS[@]}"; do
+    BUCKET="${BUCKETS[$i]}"
+    PREFIX="${PREFIXES[$i]}"
+    if aws --endpoint-url="$ENDPOINT" s3api head-object --bucket "$BUCKET" --key "$PREFIX/" >/dev/null 2>&1; then
+        echo "Folder '$PREFIX/' already exists in bucket '$BUCKET'."
+    elif aws --endpoint-url="$ENDPOINT" s3api put-object --bucket "$BUCKET" --key "$PREFIX/" >/dev/null 2>&1; then
+        echo "Created folder '$PREFIX/' in bucket '$BUCKET'."
+    else
+        echo "Could not create folder '$PREFIX/' in bucket '$BUCKET'."
     fi
 done
 

@@ -8,11 +8,16 @@ logger = logging.getLogger("db_bootstrap")
 
 def bootstrap_databases():
     # Connect to system 'postgres' database to check/create others
+    # Reads POSTGRES_USER/POSTGRES_PASSWORD (the same vars deploy/.env and
+    # Terraform's postgres_user/postgres_password variables actually set) -
+    # previously read DB_USER/DB_PASSWORD instead, which nothing in the repo
+    # ever set, so this always silently fell back to the hardcoded defaults
+    # below regardless of what was actually configured.
     conn = psycopg2.connect(
         host=os.getenv("DB_HOST", "postgres"),
         port=os.getenv("DB_PORT", "5432"),
-        user=os.getenv("DB_USER", "user"),
-        password=os.getenv("DB_PASSWORD", "Password"),
+        user=os.getenv("POSTGRES_USER", "user"),
+        password=os.getenv("POSTGRES_PASSWORD", "Password"),
         database="postgres"
     )
     conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)

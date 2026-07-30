@@ -48,12 +48,19 @@ echo Docker Engine was found inside WSL. Using it instead of Docker Desktop.
 echo.
 
 echo =======================================================
-echo   Checking LocalStack (S3) for DVC Remote Storage
+echo   Checking Administrator Privileges
 echo =======================================================
 echo.
 
-wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
+net session >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: This script must be run as Administrator so it can map LocalStack's port to Windows localhost.
+    echo Right-click this script and choose "Run as administrator", then run it again.
+    pause
+    exit /b 1
+)
 
+echo Administrator privileges confirmed.
 echo.
 
 echo =======================================================
@@ -103,6 +110,9 @@ wsl -u root k3s ctr -n k8s.io images pull docker.io/library/postgres:15-alpine
 
 echo Pulling Redis...
 wsl -u root k3s ctr -n k8s.io images pull docker.io/library/redis:7-alpine
+
+echo Pulling LocalStack 4.4.0...
+wsl -u root k3s ctr -n k8s.io images pull docker.io/localstack/localstack:4.4.0
 
 echo Images successfully cached!
 
@@ -206,16 +216,19 @@ deployment/redis ^
 deployment/mlflow ^
 deployment/prefect ^
 deployment/rossmann-api ^
+deployment/localstack ^
 service/postgres ^
 service/redis ^
 service/mlflow ^
 service/prefect ^
 service/rossmann-api-service ^
+service/localstack ^
 configmap/postgres-init-config ^
 pvc/postgres-data-pvc ^
 pvc/mlflow-data-pvc ^
 pvc/prefect-data-pvc ^
 secret/postgres-credentials ^
+secret/s3-credentials ^
 secret/rossmann-ingress-tls ^
 ingress/rossmann-ingress ^
 --ignore-not-found
@@ -278,6 +291,21 @@ if errorlevel 1 (
     exit /b 1
 )
 
+:: kubectl port-forward is flaky (silently drops, needs reconnect loops) -
+:: netsh maps Windows localhost straight to the node's real IP instead,
+:: the same stable mechanism the Compose scripts already use.
+netsh interface portproxy delete v4tov4 listenaddress=127.0.0.1 listenport=4566 >nul 2>&1
+netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=4566 connectaddress=10.21.36.158 connectport=4566 >nul
+
+echo =======================================================
+echo   Checking LocalStack (S3) for DVC Remote Storage
+echo =======================================================
+echo.
+
+wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
+
+echo.
+
 wsl -u root k3s kubectl rollout restart deployment/rossmann-api
 if errorlevel 1 (
     echo ERROR: API rollout restart failed. Aborting.
@@ -305,6 +333,8 @@ start "Prefect Orchestration Console" wsl -u root bash -c "(while true; do k3s k
 
 start "PostgreSQL Database Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/postgres 5432:5432 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/postgres; sleep 2; done"
 
+start "LocalStack Console" wsl -u root k3s kubectl logs -f deployment/localstack
+
 echo.
 echo =======================================================
 echo   Deployment Complete -- The MLOps Pipeline is Live.
@@ -312,6 +342,7 @@ echo   API Dashboard:    http://localhost:8000
 echo   MLflow Dashboard: http://localhost:5000
 echo   Prefect Portal:   http://localhost:4200
 echo   Database Access:  localhost:5432
+echo   LocalStack (S3):  localhost:4566
 echo =======================================================
 
 pause

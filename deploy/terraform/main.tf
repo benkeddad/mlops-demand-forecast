@@ -73,17 +73,77 @@ resource "kubernetes_secret" "postgres_credentials" {
 # Claude added: LocalStack's S3 endpoint reachable from INSIDE the cluster is
 # different from the host-side one (http://127.0.0.1:4566) .dvc/config.local
 # uses - pods have their own network namespace and can't reach the WSL host's
-# loopback-bound services, only the K3s node's real IP (confirmed: LocalStack
-# itself publishes 127.0.0.1:4566 only, and even the node's own IP only works
-# once that publish is changed to 0.0.0.0). This is inherently a single-node,
-# local-dev-only value with no portable way to auto-discover it generically -
-# a variable with a default matching this machine's current node IP, override
-# via terraform.tfvars if it ever changes (e.g. after a WSL/Docker restart
-# re-assigns the node's IP).
+# loopback-bound services, only the K3s node's real IP. LocalStack itself now
+# runs as a Deployment/Service inside this same cluster (below), and k3s's
+# built-in ServiceLB always publishes a LoadBalancer Service on the node's own
+# IP - the same address every other Service in this file already resolves to
+# - so this value keeps working unchanged even though LocalStack moved
+# in-cluster. Still a single-node, local-dev-only value with no portable way
+# to auto-discover it generically - override via terraform.tfvars if the
+# node's IP ever changes (e.g. after a WSL/Docker restart re-assigns it).
 variable "localstack_endpoint" {
   description = "LocalStack S3 endpoint reachable from inside the K3s cluster (node IP, not 127.0.0.1)."
   type        = string
   default     = "http://10.21.36.158:4566"
+}
+
+# LocalStack itself, pinned to 4.4.0 (plain community image - no
+# LOCALSTACK_AUTH_TOKEN needed, S3 is a free-tier service). Runs the same way
+# every other backing service in this file does: a Deployment + LoadBalancer
+# Service, image pre-pulled into containerd by the k3s deploy scripts.
+resource "kubernetes_deployment" "localstack" {
+  metadata {
+    name = "localstack"
+    labels = {
+      app = "localstack"
+    }
+  }
+
+  spec {
+    replicas = 1
+
+    selector {
+      match_labels = {
+        app = "localstack"
+      }
+    }
+
+    template {
+      metadata {
+        labels = {
+          app = "localstack"
+        }
+      }
+
+      spec {
+        container {
+          name               = "localstack"
+          image              = "localstack/localstack:4.4.0"
+          image_pull_policy  = "IfNotPresent"
+
+          port {
+            container_port = 4566
+          }
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_service" "localstack" {
+  metadata {
+    name = "localstack"
+  }
+  spec {
+    type = "LoadBalancer"
+    selector = {
+      app = "localstack"
+    }
+    port {
+      port        = 4566
+      target_port = 4566
+    }
+  }
 }
 
 # Override via terraform.tfvars or TF_VAR_aws_access_key_id / TF_VAR_aws_secret_access_key
