@@ -24,7 +24,7 @@ def run_training(processed_data_path: str):
     # forever even after the server-wide default changed. A fresh experiment
     # name is required to actually pick up the new S3-backed root; the old
     # experiment (and its run/model history) is untouched and still browsable.
-    mlflow.set_experiment("Rossmann_Sales_Forecasting_v2")
+    mlflow.set_experiment("Rossmann_Sales_Forecasting")
 
     with mlflow.start_run():
         # Store metadata reference to the exact parquet data used for training

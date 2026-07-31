@@ -44,21 +44,6 @@ if errorlevel 1 (
 
 echo Docker Engine was found inside WSL. Using it instead of Docker Desktop.
 echo.
-echo =======================================================
-echo   Checking Administrator Privileges
-echo =======================================================
-echo.
-
-net session >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: This script must be run as Administrator so it can map LocalStack's port to Windows localhost.
-    echo Right-click this script and choose "Run as administrator", then run it again.
-    pause
-    exit /b 1
-)
-
-echo Administrator privileges confirmed.
-echo.
 echo Ensuring LocalStack 4.4.0 image is cached in k3s...
 wsl -u root k3s ctr -n k8s.io images pull docker.io/localstack/localstack:4.4.0
 
@@ -526,16 +511,15 @@ if errorlevel 1 (
 echo.
 echo All deployments are available.
 
-:: kubectl port-forward is flaky (silently drops, needs reconnect loops) -
-:: netsh maps Windows localhost straight to the node's real IP instead,
-:: the same stable mechanism the Compose scripts already use.
-netsh interface portproxy delete v4tov4 listenaddress=127.0.0.1 listenport=4566 >nul 2>&1
-netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=4566 connectaddress=10.21.36.158 connectport=4566 >nul
-
 echo =======================================================
 echo   Checking LocalStack (S3) for DVC Remote Storage
 echo =======================================================
 echo.
+
+:: Started here (before the bucket check) rather than down with the other
+:: consoles - setup_localstack_bucket.sh checks 127.0.0.1:4566 from inside
+:: WSL, which only resolves once this tunnel exists.
+start "LocalStack S3 Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/localstack 4566:4566 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/localstack; sleep 2; done"
 
 wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
 
@@ -558,8 +542,6 @@ start "MLflow Tracking Console" wsl -u root bash -c "(while true; do k3s kubectl
 start "Prefect Orchestration Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/prefect 4200:4200 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/prefect; sleep 2; done"
 
 start "PostgreSQL Database Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/postgres 5432:5432 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/postgres; sleep 2; done"
-
-start "LocalStack Console" wsl -u root k3s kubectl logs -f deployment/localstack
 
 echo.
 echo =======================================================
