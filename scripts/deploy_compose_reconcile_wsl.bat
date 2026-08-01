@@ -51,22 +51,6 @@ if errorlevel 1 (
 echo Docker Engine and Compose were found inside WSL. Using them instead of Docker Desktop.
 echo.
 
-echo =======================================================
-echo   Checking Administrator Privileges
-echo =======================================================
-echo.
-
-net session >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: This script must be run as Administrator so it can map WSL ports to Windows localhost.
-    echo Right-click this script and choose "Run as administrator", then run it again.
-    pause
-    exit /b 1
-)
-
-echo Administrator privileges confirmed.
-echo.
-
 echo ===================================================
 echo   Docker Compose Non-Destructive Reconciliation
 echo ===================================================
@@ -112,22 +96,6 @@ wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
 
 echo.
 echo ===================================================
-echo   Mapping Windows localhost to the WSL Docker containers
-echo ===================================================
-echo.
-
-echo Resolving current WSL IP address...
-for /f "tokens=1" %%A in ('wsl hostname -I') do set "WSL_IP=%%A"
-if not defined WSL_IP (echo ERROR: Unable to resolve the WSL IP address. & pause & exit /b 1)
-
-echo WSL IP address: %WSL_IP%
-
-for %%P in (8000 5000 4200 5432 6379 4566) do (netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=%%P >nul 2>&1 & netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=%%P connectaddress=%WSL_IP% connectport=%%P >nul)
-
-echo All ports mapped from Windows localhost to WSL IP %WSL_IP%.
-echo.
-
-echo ===================================================
 echo   Launching Application Interfaces and Live Logging...
 echo ===================================================
 
@@ -146,6 +114,12 @@ echo.
 echo   Existing volumes were preserved.
 echo   Healthy unchanged containers were preserved.
 echo   Missing or stopped services were started.
+echo.
+echo   API Dashboard:    http://localhost:8000
+echo   MLflow Dashboard: http://localhost:5000
+echo   Prefect Portal:   http://localhost:4200
+echo   Database Access:  localhost:5432
+echo   LocalStack (S3):  localhost:4566
 echo ===================================================
 
 pause

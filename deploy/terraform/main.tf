@@ -70,21 +70,19 @@ resource "kubernetes_secret" "postgres_credentials" {
   type = "Opaque"
 }
 
-# Claude added: LocalStack's S3 endpoint reachable from INSIDE the cluster is
-# different from the host-side one (http://127.0.0.1:4566) .dvc/config.local
-# uses - pods have their own network namespace and can't reach the WSL host's
-# loopback-bound services, only the K3s node's real IP. LocalStack itself now
-# runs as a Deployment/Service inside this same cluster (below), and k3s's
-# built-in ServiceLB always publishes a LoadBalancer Service on the node's own
-# IP - the same address every other Service in this file already resolves to
-# - so this value keeps working unchanged even though LocalStack moved
-# in-cluster. Still a single-node, local-dev-only value with no portable way
-# to auto-discover it generically - override via terraform.tfvars if the
-# node's IP ever changes (e.g. after a WSL/Docker restart re-assigns it).
+# LocalStack runs as its own in-cluster Deployment/Service (below, Service
+# name "localstack"), so pods reach it exactly the way Docker Compose's own
+# containers already reach it - through DNS, not an IP. Compose uses
+# http://localstack:4566 via Docker's built-in DNS; here it's Kubernetes'
+# built-in Service DNS, which resolves "localstack" to the right ClusterIP
+# automatically inside the default namespace - the same pattern this file
+# already relies on for MLFLOW_TRACKING_URI ("http://mlflow:5000") and
+# PREFECT_API_URL ("http://prefect:4200/api") above. No node IP involved, so
+# nothing to keep in sync across a WSL/K3s restart.
 variable "localstack_endpoint" {
-  description = "LocalStack S3 endpoint reachable from inside the K3s cluster (node IP, not 127.0.0.1)."
+  description = "LocalStack S3 endpoint reachable from inside the K3s cluster (in-cluster Service DNS name)."
   type        = string
-  default     = "http://10.21.36.158:4566"
+  default     = "http://localstack:4566"
 }
 
 # LocalStack itself, pinned to 4.4.0 (plain community image - no
