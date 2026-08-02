@@ -48,6 +48,28 @@ echo Docker Engine was found inside WSL. Using it instead of Docker Desktop.
 echo.
 
 echo =======================================================
+echo   Freeing Ports Held by a Running Docker Compose Stack
+echo =======================================================
+echo.
+echo Docker Compose and the K3s deployment publish the same host ports
+echo (8000, 5000, 4200, 5432, 4566), so only one stack can serve them
+echo at a time. Checking whether Compose currently owns them...
+echo.
+
+set "COMPOSE_RUNNING="
+for /f "delims=" %%i in ('wsl -u root docker ps -q -f "name=rossmann_api" 2^>nul') do set "COMPOSE_RUNNING=%%i"
+
+if defined COMPOSE_RUNNING (
+    echo Docker Compose stack is running - stopping its containers so K3s
+    echo can bind cleanly. Data and images are preserved; restart Compose
+    echo any time with scripts\deploy_compose_reconcile_wsl.bat.
+    call wsl -u root bash -c "cd $(wslpath '%CD%') && docker compose -f deploy/docker-compose.yaml stop"
+) else (
+    echo Docker Compose is not running. No port conflicts to resolve.
+)
+echo.
+
+echo =======================================================
 echo   [1/6] Resetting WSL Subsystem & Starting K3s Server
 echo =======================================================
 
@@ -56,8 +78,41 @@ echo Resetting WSL to guarantee clean storage mounts...
 wsl --shutdown
 timeout /t 3 /nobreak >nul
 
-:: Open K3s in a fresh window using the native loopback setup
-start "K3s Engine (DO NOT CLOSE)" wsl -u root k3s server --bind-address=127.0.0.1
+:: wsl --shutdown above also killed the Docker daemon checked earlier in
+:: this script, so it has to come back up before step [4/6] can "docker build".
+echo Restarting the Docker Engine inside WSL Ubuntu after the reset...
+wsl -u root systemctl start docker >nul 2>&1
+
+set /a DOCKER_WAIT_COUNT=0
+:wait_docker_after_shutdown
+wsl -u root docker version >nul 2>&1
+if errorlevel 1 (
+    set /a DOCKER_WAIT_COUNT+=1
+    if !DOCKER_WAIT_COUNT! GEQ 20 (
+        echo.
+        echo ERROR: Docker did not come back up inside WSL after the reset.
+        pause
+        exit /b 1
+    )
+    timeout /t 3 /nobreak >nul
+    goto wait_docker_after_shutdown
+)
+echo Docker Engine is back online.
+echo.
+
+:: Restart K3s as the systemd-managed service - the same service
+:: deploy_k3s_reconcile_wsl.bat manages via systemctl - instead of a bare
+:: "k3s server" process. Two different ways of starting k3s would race
+:: each other for ports 6443/10250 the moment both scripts get run in
+:: the same session, which is exactly the failure this fixes.
+echo Restarting the K3s service...
+wsl -u root systemctl restart k3s
+if errorlevel 1 (
+    echo ERROR: K3s service could not be restarted. Is k3s installed as a
+    echo systemd service inside the WSL Ubuntu distro?
+    pause
+    exit /b 1
+)
 
 echo Waiting for Kubernetes API to Wake Up...
 set /a WAIT_COUNT=0
@@ -283,6 +338,7 @@ echo.
 :: Started here (before the bucket check) rather than down with the other
 :: consoles - setup_localstack_bucket.sh checks 127.0.0.1:4566 from inside
 :: WSL, which only resolves once this tunnel exists.
+taskkill /FI "WINDOWTITLE eq LocalStack S3 Console*" /F >nul 2>&1
 start "LocalStack S3 Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/localstack 4566:4566 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/localstack; sleep 2; done"
 
 wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
@@ -308,12 +364,16 @@ echo =======================================================
 echo   Launching Application Interfaces and Live Logging...
 echo =======================================================
 
+taskkill /FI "WINDOWTITLE eq Rossmann FastAPI App Console*" /F >nul 2>&1
 start "Rossmann FastAPI App Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/rossmann-api-service 8000:8000 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/rossmann-api; sleep 2; done"
 
+taskkill /FI "WINDOWTITLE eq MLflow Tracking Console*" /F >nul 2>&1
 start "MLflow Tracking Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/mlflow 5000:5000 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/mlflow; sleep 2; done"
 
+taskkill /FI "WINDOWTITLE eq Prefect Orchestration Console*" /F >nul 2>&1
 start "Prefect Orchestration Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/prefect 4200:4200 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/prefect; sleep 2; done"
 
+taskkill /FI "WINDOWTITLE eq PostgreSQL Database Console*" /F >nul 2>&1
 start "PostgreSQL Database Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/postgres 5432:5432 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/postgres; sleep 2; done"
 
 echo.

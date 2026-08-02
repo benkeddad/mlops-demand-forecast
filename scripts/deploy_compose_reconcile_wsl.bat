@@ -51,6 +51,27 @@ if errorlevel 1 (
 echo Docker Engine and Compose were found inside WSL. Using them instead of Docker Desktop.
 echo.
 
+echo =======================================================
+echo   Freeing Ports Held by a Running K3s Deployment
+echo =======================================================
+echo.
+echo Docker Compose and the K3s deployment publish the same host ports
+echo (8000, 5000, 4200, 5432, 4566), so only one stack can serve them
+echo at a time. Checking whether K3s currently owns them...
+echo.
+
+wsl -u root systemctl is-active --quiet k3s
+if not errorlevel 1 (
+    echo K3s is running - stopping its port-forward tunnels so Compose
+    echo can bind cleanly. The K3s cluster and its deployments are left
+    echo running untouched; reconnect to them any time with
+    echo scripts\deploy_k3s_reconcile_wsl.bat.
+    wsl -u root pkill -f "port-forward" >nul 2>&1
+) else (
+    echo K3s is not running. No port conflicts to resolve.
+)
+echo.
+
 echo ===================================================
 echo   Docker Compose Non-Destructive Reconciliation
 echo ===================================================
@@ -99,12 +120,16 @@ echo ===================================================
 echo   Launching Application Interfaces and Live Logging...
 echo ===================================================
 
+taskkill /FI "WINDOWTITLE eq Rossmann FastAPI App Console*" /F >nul 2>&1
 start "Rossmann FastAPI App Console" wsl -u root bash -c "while true; do docker logs -f rossmann_api; sleep 2; done"
 
+taskkill /FI "WINDOWTITLE eq MLflow Tracking Console*" /F >nul 2>&1
 start "MLflow Tracking Console" wsl -u root bash -c "while true; do docker logs -f rossmann_mlflow; sleep 2; done"
 
+taskkill /FI "WINDOWTITLE eq Prefect Orchestration Console*" /F >nul 2>&1
 start "Prefect Orchestration Console" wsl -u root bash -c "while true; do docker logs -f rossmann_prefect; sleep 2; done"
 
+taskkill /FI "WINDOWTITLE eq PostgreSQL Database Console*" /F >nul 2>&1
 start "PostgreSQL Database Console" wsl -u root bash -c "while true; do docker logs -f rossmann_postgres; sleep 2; done"
 
 echo.

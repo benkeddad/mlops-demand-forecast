@@ -50,6 +50,28 @@ wsl -u root k3s ctr -n k8s.io images pull docker.io/localstack/localstack:4.4.0
 echo.
 
 echo =======================================================
+echo   Freeing Ports Held by a Running Docker Compose Stack
+echo =======================================================
+echo.
+echo Docker Compose and the K3s deployment publish the same host ports
+echo (8000, 5000, 4200, 5432, 4566), so only one stack can serve them
+echo at a time. Checking whether Compose currently owns them...
+echo.
+
+set "COMPOSE_RUNNING="
+for /f "delims=" %%i in ('wsl -u root docker ps -q -f "name=rossmann_api" 2^>nul') do set "COMPOSE_RUNNING=%%i"
+
+if defined COMPOSE_RUNNING (
+    echo Docker Compose stack is running - stopping its containers so K3s
+    echo can bind cleanly. Data and images are preserved; restart Compose
+    echo any time with scripts\deploy_compose_reconcile_wsl.bat.
+    call wsl -u root bash -c "cd $(wslpath '%CD%') && docker compose -f deploy/docker-compose.yaml stop"
+) else (
+    echo Docker Compose is not running. No port conflicts to resolve.
+)
+echo.
+
+echo =======================================================
 echo   Rossmann MLOps Non-Destructive Recovery Startup
 echo =======================================================
 echo.
@@ -519,6 +541,7 @@ echo.
 :: Started here (before the bucket check) rather than down with the other
 :: consoles - setup_localstack_bucket.sh checks 127.0.0.1:4566 from inside
 :: WSL, which only resolves once this tunnel exists.
+taskkill /FI "WINDOWTITLE eq LocalStack S3 Console*" /F >nul 2>&1
 start "LocalStack S3 Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/localstack 4566:4566 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/localstack; sleep 2; done"
 
 wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
@@ -535,12 +558,16 @@ echo.
 wsl -u root k3s kubectl get pvc
 echo.
 
+taskkill /FI "WINDOWTITLE eq Rossmann FastAPI App Console*" /F >nul 2>&1
 start "Rossmann FastAPI App Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/rossmann-api-service 8000:8000 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/rossmann-api; sleep 2; done"
 
+taskkill /FI "WINDOWTITLE eq MLflow Tracking Console*" /F >nul 2>&1
 start "MLflow Tracking Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/mlflow 5000:5000 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/mlflow; sleep 2; done"
 
+taskkill /FI "WINDOWTITLE eq Prefect Orchestration Console*" /F >nul 2>&1
 start "Prefect Orchestration Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/prefect 4200:4200 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/prefect; sleep 2; done"
 
+taskkill /FI "WINDOWTITLE eq PostgreSQL Database Console*" /F >nul 2>&1
 start "PostgreSQL Database Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/postgres 5432:5432 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/postgres; sleep 2; done"
 
 echo.
