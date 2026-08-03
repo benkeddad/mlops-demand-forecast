@@ -4,6 +4,11 @@ setlocal enabledelayedexpansion
 :: This script lives in scripts\, so move to the repository root.
 cd /d "%~dp0.."
 
+:: Name of the k3d cluster the K3s deploy scripts create - only used
+:: here to check for, and cleanly stop, a running K3s deployment that
+:: would otherwise be holding the ports Compose needs (see below).
+set "K3D_CLUSTER=rossmann"
+
 :: WSL-Docker variant of deploy_compose_clean.bat: identical logic, except
 :: every Docker / Docker Compose command runs against the Docker Engine
 :: installed inside the WSL Ubuntu distro (faster) instead of Docker Desktop.
@@ -48,6 +53,29 @@ if errorlevel 1 (
 )
 
 echo Docker Engine and Compose were found inside WSL. Using them instead of Docker Desktop.
+echo.
+
+echo =======================================================
+echo   Freeing Ports Held by a Running K3s Deployment
+echo =======================================================
+echo.
+echo Docker Compose and the k3d-provisioned K3s cluster publish the same
+echo host ports (8000, 5000, 4200, 5432, 4566) directly from k3d cluster
+echo create, so only one stack can serve them at a time. Checking whether
+echo K3s currently owns them...
+echo.
+
+set "K3D_RUNNING="
+for /f "delims=" %%i in ('wsl -u root docker ps -q -f "name=k3d-%K3D_CLUSTER%-serverlb" 2^>nul') do set "K3D_RUNNING=%%i"
+
+if defined K3D_RUNNING (
+    echo K3d cluster "%K3D_CLUSTER%" is running - stopping it so Compose can
+    echo bind cleanly. Cluster state and volumes are preserved; resume it
+    echo any time with scripts\deploy_k3s_reconcile_wsl.bat.
+    wsl -u root k3d cluster stop %K3D_CLUSTER% >nul 2>&1
+) else (
+    echo K3s is not running. No port conflicts to resolve.
+)
 echo.
 
 echo =======================================================
@@ -131,12 +159,16 @@ echo =======================================================
 echo   Launching Application Interfaces and Live Logging...
 echo =======================================================
 
+taskkill /FI "WINDOWTITLE eq Rossmann FastAPI App Console*" /F >nul 2>&1
 start "Rossmann FastAPI App Console" wsl -u root bash -c "while true; do docker logs -f rossmann_api; sleep 2; done"
 
+taskkill /FI "WINDOWTITLE eq MLflow Tracking Console*" /F >nul 2>&1
 start "MLflow Tracking Console" wsl -u root bash -c "while true; do docker logs -f rossmann_mlflow; sleep 2; done"
 
+taskkill /FI "WINDOWTITLE eq Prefect Orchestration Console*" /F >nul 2>&1
 start "Prefect Orchestration Console" wsl -u root bash -c "while true; do docker logs -f rossmann_prefect; sleep 2; done"
 
+taskkill /FI "WINDOWTITLE eq PostgreSQL Database Console*" /F >nul 2>&1
 start "PostgreSQL Database Console" wsl -u root bash -c "while true; do docker logs -f rossmann_postgres; sleep 2; done"
 
 echo.
