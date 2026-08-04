@@ -4,11 +4,6 @@ setlocal enabledelayedexpansion
 :: This script lives in scripts\, so move to the repository root.
 cd /d "%~dp0.."
 
-:: Name of the k3d cluster the K3s deploy scripts create - only used
-:: here to check for, and cleanly stop, a running K3s deployment that
-:: would otherwise be holding the ports Compose needs (see below).
-set "K3D_CLUSTER=rossmann"
-
 :: WSL-Docker variant of deploy_compose_clean.bat: identical logic, except
 :: every Docker / Docker Compose command runs against the Docker Engine
 :: installed inside the WSL Ubuntu distro (faster) instead of Docker Desktop.
@@ -59,20 +54,38 @@ echo =======================================================
 echo   Freeing Ports Held by a Running K3s Deployment
 echo =======================================================
 echo.
-echo Docker Compose and the k3d-provisioned K3s cluster publish the same
-echo host ports (8000, 5000, 4200, 5432, 4566) directly from k3d cluster
-echo create, so only one stack can serve them at a time. Checking whether
-echo K3s currently owns them...
+echo Docker Compose and the K3s deployment publish the same host ports
+echo (8000, 5000, 4200, 5432, 4566), so only one stack can serve them
+echo at a time. Checking whether K3s currently owns them...
 echo.
 
-set "K3D_RUNNING="
-for /f "delims=" %%i in ('wsl -u root docker ps -q -f "name=k3d-%K3D_CLUSTER%-serverlb" 2^>nul') do set "K3D_RUNNING=%%i"
+wsl -u root systemctl is-active --quiet k3s
+if not errorlevel 1 (
+    echo K3s is running - stopping it so Compose can bind its ports cleanly.
+    echo K3s's own ServiceLB binds LoadBalancer ports directly on this host,
+    echo independent of any kubectl port-forward tunnel, so only stopping
+    echo k3s itself actually releases them. Cluster state/PVCs are left
+    echo untouched; restart K3s any time with scripts\deploy_k3s_reconcile_wsl.bat.
+    wsl -u root pkill -f "port-forward" >nul 2>&1
+    wsl -u root systemctl stop k3s
 
-if defined K3D_RUNNING (
-    echo K3d cluster "%K3D_CLUSTER%" is running - stopping it so Compose can
-    echo bind cleanly. Cluster state and volumes are preserved; resume it
-    echo any time with scripts\deploy_k3s_reconcile_wsl.bat.
-    wsl -u root k3d cluster stop %K3D_CLUSTER% >nul 2>&1
+    set /a K3S_STOP_WAIT=0
+    :wait_k3s_stop_clean_compose
+    wsl -u root systemctl is-active --quiet k3s
+    if not errorlevel 1 (
+        set /a K3S_STOP_WAIT+=1
+        if !K3S_STOP_WAIT! GEQ 20 (
+            echo.
+            echo ERROR: K3s did not stop within 40 seconds.
+            pause
+            exit /b 1
+        )
+        timeout /t 2 /nobreak >nul
+        goto wait_k3s_stop_clean_compose
+    )
+
+    echo K3s stopped. Giving containerd a moment to release its host ports...
+    timeout /t 3 /nobreak >nul
 ) else (
     echo K3s is not running. No port conflicts to resolve.
 )
@@ -127,10 +140,37 @@ if errorlevel 1 (
 echo.
 echo [3/3] Creating a completely new Docker Compose stack...
 
-call wsl -u root bash -c "cd $(wslpath '%CD%') && docker compose -f deploy/docker-compose.yaml up -d --force-recreate --renew-anon-volumes"
+:: api is deliberately excluded here and started only after PostgreSQL is
+:: seeded below - otherwise its entrypoint would reach its training stage
+:: against a still-empty train/test table.
+call wsl -u root bash -c "cd $(wslpath '%CD%') && docker compose -f deploy/docker-compose.yaml up -d --force-recreate --renew-anon-volumes postgres redis localstack mlflow prefect"
 if errorlevel 1 (
     echo.
     echo ERROR: Docker Compose startup failed.
+    pause
+    exit /b 1
+)
+
+echo.
+echo =======================================================
+echo   Preparing LocalStack (S3) and PostgreSQL Seed Data
+echo =======================================================
+echo.
+
+wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_and_postgres.sh"
+if errorlevel 1 (
+    echo.
+    echo ERROR: LocalStack/PostgreSQL bootstrap failed.
+    pause
+    exit /b 1
+)
+
+echo.
+echo Starting the Rossmann API service now that PostgreSQL is seeded...
+call wsl -u root bash -c "cd $(wslpath '%CD%') && docker compose -f deploy/docker-compose.yaml up -d --force-recreate --renew-anon-volumes api"
+if errorlevel 1 (
+    echo.
+    echo ERROR: Starting the Rossmann API service failed.
     pause
     exit /b 1
 )
@@ -145,14 +185,6 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-
-echo.
-echo =======================================================
-echo   Checking LocalStack (S3) for DVC Remote Storage
-echo =======================================================
-echo.
-
-wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
 
 echo.
 echo =======================================================

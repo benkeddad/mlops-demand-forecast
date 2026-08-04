@@ -53,7 +53,7 @@ jobs:
       - name: Load schema and seed reference/current data
         run: |
           psql "$DATABASE_URL" -f db/init.sql
-          python src/seed_db.py
+          python db/seed_db.py
 
       - name: Run drift check (train = reference, test = current)
         id: drift

@@ -49,6 +49,15 @@ def test_push_stage_runs_dvc_push_when_s3_endpoint_configured():
     assert kwargs["check"] is True
 
 
+def test_ingest_stage_passes_localstack_endpoint_to_dvc_subprocess():
+    with patch.dict("os.environ", {"MLFLOW_S3_ENDPOINT_URL": "http://localstack:4566"}, clear=True):
+        with patch("pipelines.training_pipeline.subprocess.run") as mock_run:
+            dvc_ingest.fn()
+    _, kwargs = mock_run.call_args
+    assert kwargs["env"]["AWS_ENDPOINT_URL"] == "http://localstack:4566"
+    assert kwargs["env"]["AWS_ENDPOINT_URL_S3"] == "http://localstack:4566"
+
+
 def test_push_stage_skips_dvc_push_without_s3_endpoint():
     with patch.dict("os.environ", {}, clear=True):
         with patch("pipelines.training_pipeline.subprocess.run") as mock_run:

@@ -4,20 +4,12 @@ setlocal enabledelayedexpansion
 :: This script lives in scripts\, so move to the repository root.
 cd /d "%~dp0.."
 
-:: Name of the k3d cluster this script reconciles against. Must match the
-:: name deploy_k3s_clean_wsl.bat creates - k3d runs K3s itself inside
-:: Docker containers instead of installing it directly on the WSL host, so
-:: cluster lifecycle goes through the k3d CLI instead of systemctl, and
-:: kubectl is a separate binary rather than bundled into the k3s binary
-:: the way "k3s kubectl" was.
-set "K3D_CLUSTER=rossmann"
-
 :: Non-destructive K3s reconciliation, with image builds run against the
 :: Docker Engine installed inside the WSL Ubuntu distro (not Docker Desktop's
-:: own engine). It also calls Docker directly now for the LocalStack image
-:: pull and the Compose-conflict check (k3d image import needs a local
-:: Docker image to import, and there's no bundled "k3s ctr" equivalent to
-:: pull straight from a registry the way bare K3s could).
+:: own engine). This script does not call Docker directly for its own logic
+:: (only k3s/kubectl and Terraform through WSL), but it still verifies Docker
+:: Engine is available inside WSL Ubuntu for consistency with
+:: the rest of the WSL-Docker script set.
 
 echo =======================================================
 echo   Checking Docker Engine inside WSL Ubuntu
@@ -52,36 +44,8 @@ if errorlevel 1 (
 
 echo Docker Engine was found inside WSL. Using it instead of Docker Desktop.
 echo.
-
-echo =======================================================
-echo   Checking k3d and kubectl inside WSL Ubuntu
-echo =======================================================
-echo.
-
-wsl -u root k3d version >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: k3d is not installed, or not on root's PATH, inside WSL Ubuntu.
-    echo Install it with:
-    echo   wsl -u root bash -c "curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh ^| bash"
-    pause
-    exit /b 1
-)
-
-wsl -u root kubectl version --client >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: kubectl is not installed, or not on root's PATH, inside WSL Ubuntu.
-    echo Unlike the k3s binary, k3d does not bundle its own kubectl - install it
-    echo separately, e.g.:
-    echo   wsl -u root bash -c "curl -LO https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl ^&^& install -m 0755 kubectl /usr/local/bin/kubectl"
-    pause
-    exit /b 1
-)
-
-echo k3d and kubectl were found inside WSL.
-echo.
-echo Ensuring LocalStack 4.4.0 image is cached in k3d...
-wsl -u root docker pull docker.io/localstack/localstack:4.4.0
-wsl -u root k3d image import docker.io/localstack/localstack:4.4.0 -c %K3D_CLUSTER%
+echo Ensuring LocalStack 4.4.0 image is cached in k3s...
+wsl -u root k3s ctr -n k8s.io images pull docker.io/localstack/localstack:4.4.0
 
 echo.
 
@@ -102,6 +66,8 @@ if defined COMPOSE_RUNNING (
     echo can bind cleanly. Data and images are preserved; restart Compose
     echo any time with scripts\deploy_compose_reconcile_wsl.bat.
     call wsl -u root bash -c "cd $(wslpath '%CD%') && docker compose -f deploy/docker-compose.yaml stop"
+    echo Giving Docker a moment to release its host ports...
+    timeout /t 3 /nobreak >nul
 ) else (
     echo Docker Compose is not running. No port conflicts to resolve.
 )
@@ -126,50 +92,29 @@ echo =======================================================
 echo.
 
 echo =======================================================
-echo   [1/6] Checking the k3d Cluster
+echo   [1/6] Checking K3s
 echo =======================================================
 
-wsl -u root k3d cluster list %K3D_CLUSTER% >nul 2>&1
+wsl -u root systemctl is-active --quiet k3s
 
 if errorlevel 1 (
-    :: No cluster by this name exists yet - this is effectively a first run,
-    :: so create it fresh instead of erroring out the way "systemctl start"
-    :: on a never-installed service would have. See deploy_k3s_clean_wsl.bat
-    :: for why each port is mapped straight through: every Service in
-    :: deploy/terraform/main.tf is type: LoadBalancer on its own distinct
-    :: port, so k3d's built-in ServiceLB reaches them directly with no
-    :: Ingress/hostname routing and no kubectl port-forward tunnel involved.
-    echo K3d cluster "%K3D_CLUSTER%" does not exist yet. Creating it...
-    wsl -u root k3d cluster create %K3D_CLUSTER% ^
-        --api-port 6550 ^
-        -p "8000:8000@loadbalancer" ^
-        -p "5000:5000@loadbalancer" ^
-        -p "4200:4200@loadbalancer" ^
-        -p "5432:5432@loadbalancer" ^
-        -p "4566:4566@loadbalancer" ^
-        --wait --timeout 120s
+    echo K3s is not running. Starting K3s...
+    wsl -u root systemctl start k3s
 
     if errorlevel 1 (
-        echo ERROR: k3d cluster create failed.
+        echo ERROR: K3s could not be started.
         pause
         exit /b 1
     )
 ) else (
-    echo K3d cluster "%K3D_CLUSTER%" exists. Making sure it is running...
-    wsl -u root k3d cluster start %K3D_CLUSTER%
-
-    if errorlevel 1 (
-        echo ERROR: K3d cluster could not be started.
-        pause
-        exit /b 1
-    )
+    echo K3s is already running. Skipping startup.
 )
 
 echo Waiting for Kubernetes API...
 set /a WAIT_COUNT=0
 
 :wait_k3s
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get nodes >nul 2>&1
+wsl -u root k3s kubectl get nodes >nul 2>&1
 
 if errorlevel 1 (
     set /a WAIT_COUNT+=1
@@ -189,7 +134,7 @@ echo Kubernetes API is online.
 
 echo.
 echo Current cluster node status:
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get nodes
+wsl -u root k3s kubectl get nodes
 
 echo =======================================================
 echo   [2/6] Preparing Terraform Credentials
@@ -201,7 +146,7 @@ if not exist "deploy\terraform" (
     exit /b 1
 )
 
-wsl -u root k3d kubeconfig get %K3D_CLUSTER% > deploy\terraform\k3s.yaml
+wsl -u root cat /etc/rancher/k3s/k3s.yaml > deploy\terraform\k3s.yaml
 
 if errorlevel 1 (
     echo ERROR: Failed to copy the K3s kubeconfig.
@@ -240,7 +185,7 @@ echo =======================================================
 set "NEED_TERRAFORM_APPLY=0"
 
 echo Checking ConfigMap postgres-init-config...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get configmap postgres-init-config >nul 2>&1
+wsl -u root k3s kubectl get configmap postgres-init-config >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: configmap/postgres-init-config
@@ -250,7 +195,7 @@ if errorlevel 1 (
 )
 
 echo Checking PersistentVolumeClaim postgres-data-pvc...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get pvc postgres-data-pvc >nul 2>&1
+wsl -u root k3s kubectl get pvc postgres-data-pvc >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: pvc/postgres-data-pvc
@@ -260,7 +205,7 @@ if errorlevel 1 (
 )
 
 echo Checking PersistentVolumeClaim mlflow-data-pvc...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get pvc mlflow-data-pvc >nul 2>&1
+wsl -u root k3s kubectl get pvc mlflow-data-pvc >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: pvc/mlflow-data-pvc
@@ -270,7 +215,7 @@ if errorlevel 1 (
 )
 
 echo Checking PersistentVolumeClaim prefect-data-pvc...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get pvc prefect-data-pvc >nul 2>&1
+wsl -u root k3s kubectl get pvc prefect-data-pvc >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: pvc/prefect-data-pvc
@@ -280,7 +225,7 @@ if errorlevel 1 (
 )
 
 echo Checking Service postgres...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get service postgres >nul 2>&1
+wsl -u root k3s kubectl get service postgres >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: service/postgres
@@ -290,7 +235,7 @@ if errorlevel 1 (
 )
 
 echo Checking Service redis...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get service redis >nul 2>&1
+wsl -u root k3s kubectl get service redis >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: service/redis
@@ -300,7 +245,7 @@ if errorlevel 1 (
 )
 
 echo Checking Service mlflow...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get service mlflow >nul 2>&1
+wsl -u root k3s kubectl get service mlflow >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: service/mlflow
@@ -310,7 +255,7 @@ if errorlevel 1 (
 )
 
 echo Checking Service prefect...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get service prefect >nul 2>&1
+wsl -u root k3s kubectl get service prefect >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: service/prefect
@@ -320,7 +265,7 @@ if errorlevel 1 (
 )
 
 echo Checking Service rossmann-api-service...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get service rossmann-api-service >nul 2>&1
+wsl -u root k3s kubectl get service rossmann-api-service >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: service/rossmann-api-service
@@ -330,7 +275,7 @@ if errorlevel 1 (
 )
 
 echo Checking Deployment postgres...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get deployment postgres >nul 2>&1
+wsl -u root k3s kubectl get deployment postgres >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: deployment/postgres
@@ -340,7 +285,7 @@ if errorlevel 1 (
 )
 
 echo Checking Deployment redis...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get deployment redis >nul 2>&1
+wsl -u root k3s kubectl get deployment redis >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: deployment/redis
@@ -350,7 +295,7 @@ if errorlevel 1 (
 )
 
 echo Checking Deployment mlflow...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get deployment mlflow >nul 2>&1
+wsl -u root k3s kubectl get deployment mlflow >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: deployment/mlflow
@@ -360,7 +305,7 @@ if errorlevel 1 (
 )
 
 echo Checking Deployment prefect...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get deployment prefect >nul 2>&1
+wsl -u root k3s kubectl get deployment prefect >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: deployment/prefect
@@ -370,7 +315,7 @@ if errorlevel 1 (
 )
 
 echo Checking Deployment rossmann-api...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get deployment rossmann-api >nul 2>&1
+wsl -u root k3s kubectl get deployment rossmann-api >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: deployment/rossmann-api
@@ -380,7 +325,7 @@ if errorlevel 1 (
 )
 
 echo Checking Deployment localstack...
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get deployment localstack >nul 2>&1
+wsl -u root k3s kubectl get deployment localstack >nul 2>&1
 
 if errorlevel 1 (
     echo MISSING: deployment/localstack
@@ -416,12 +361,12 @@ echo =======================================================
 echo.
 echo Checking PostgreSQL deployment...
 
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout status deployment/postgres --timeout=10s >nul 2>&1
+wsl -u root k3s kubectl rollout status deployment/postgres --timeout=10s >nul 2>&1
 
 if errorlevel 1 (
     echo PostgreSQL is not healthy. Restarting deployment/postgres...
 
-    wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout restart deployment/postgres
+    wsl -u root k3s kubectl rollout restart deployment/postgres
 
     if errorlevel 1 (
         echo ERROR: PostgreSQL restart command failed.
@@ -429,12 +374,12 @@ if errorlevel 1 (
         exit /b 1
     )
 
-    wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout status deployment/postgres --timeout=180s
+    wsl -u root k3s kubectl rollout status deployment/postgres --timeout=180s
 
     if errorlevel 1 (
         echo ERROR: PostgreSQL did not become ready after restart.
         echo.
-        wsl -u root kubectl --context k3d-%K3D_CLUSTER% get pods
+        wsl -u root k3s kubectl get pods
         pause
         exit /b 1
     )
@@ -445,12 +390,12 @@ if errorlevel 1 (
 echo.
 echo Checking Redis deployment...
 
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout status deployment/redis --timeout=10s >nul 2>&1
+wsl -u root k3s kubectl rollout status deployment/redis --timeout=10s >nul 2>&1
 
 if errorlevel 1 (
     echo Redis is not healthy. Restarting deployment/redis...
 
-    wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout restart deployment/redis
+    wsl -u root k3s kubectl rollout restart deployment/redis
 
     if errorlevel 1 (
         echo ERROR: Redis restart command failed.
@@ -458,12 +403,12 @@ if errorlevel 1 (
         exit /b 1
     )
 
-    wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout status deployment/redis --timeout=180s
+    wsl -u root k3s kubectl rollout status deployment/redis --timeout=180s
 
     if errorlevel 1 (
         echo ERROR: Redis did not become ready after restart.
         echo.
-        wsl -u root kubectl --context k3d-%K3D_CLUSTER% get pods
+        wsl -u root k3s kubectl get pods
         pause
         exit /b 1
     )
@@ -474,12 +419,12 @@ if errorlevel 1 (
 echo.
 echo Checking MLflow deployment...
 
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout status deployment/mlflow --timeout=10s >nul 2>&1
+wsl -u root k3s kubectl rollout status deployment/mlflow --timeout=10s >nul 2>&1
 
 if errorlevel 1 (
     echo MLflow is not healthy. Restarting deployment/mlflow...
 
-    wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout restart deployment/mlflow
+    wsl -u root k3s kubectl rollout restart deployment/mlflow
 
     if errorlevel 1 (
         echo ERROR: MLflow restart command failed.
@@ -487,12 +432,12 @@ if errorlevel 1 (
         exit /b 1
     )
 
-    wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout status deployment/mlflow --timeout=180s
+    wsl -u root k3s kubectl rollout status deployment/mlflow --timeout=180s
 
     if errorlevel 1 (
         echo ERROR: MLflow did not become ready after restart.
         echo.
-        wsl -u root kubectl --context k3d-%K3D_CLUSTER% get pods
+        wsl -u root k3s kubectl get pods
         pause
         exit /b 1
     )
@@ -503,12 +448,12 @@ if errorlevel 1 (
 echo.
 echo Checking Prefect deployment...
 
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout status deployment/prefect --timeout=10s >nul 2>&1
+wsl -u root k3s kubectl rollout status deployment/prefect --timeout=10s >nul 2>&1
 
 if errorlevel 1 (
     echo Prefect is not healthy. Restarting deployment/prefect...
 
-    wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout restart deployment/prefect
+    wsl -u root k3s kubectl rollout restart deployment/prefect
 
     if errorlevel 1 (
         echo ERROR: Prefect restart command failed.
@@ -516,12 +461,12 @@ if errorlevel 1 (
         exit /b 1
     )
 
-    wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout status deployment/prefect --timeout=180s
+    wsl -u root k3s kubectl rollout status deployment/prefect --timeout=180s
 
     if errorlevel 1 (
         echo ERROR: Prefect did not become ready after restart.
         echo.
-        wsl -u root kubectl --context k3d-%K3D_CLUSTER% get pods
+        wsl -u root k3s kubectl get pods
         pause
         exit /b 1
     )
@@ -530,43 +475,14 @@ if errorlevel 1 (
 )
 
 echo.
-echo Checking Rossmann API deployment...
-
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout status deployment/rossmann-api --timeout=10s >nul 2>&1
-
-if errorlevel 1 (
-    echo Rossmann API is not healthy. Restarting deployment/rossmann-api...
-
-    wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout restart deployment/rossmann-api
-
-    if errorlevel 1 (
-        echo ERROR: Rossmann API restart command failed.
-        pause
-        exit /b 1
-    )
-
-    wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout status deployment/rossmann-api --timeout=300s
-
-    if errorlevel 1 (
-        echo ERROR: Rossmann API did not become ready after restart.
-        echo.
-        wsl -u root kubectl --context k3d-%K3D_CLUSTER% get pods
-        pause
-        exit /b 1
-    )
-) else (
-    echo Rossmann API is healthy. Skipping restart.
-)
-
-echo.
 echo Checking LocalStack deployment...
 
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout status deployment/localstack --timeout=10s >nul 2>&1
+wsl -u root k3s kubectl rollout status deployment/localstack --timeout=10s >nul 2>&1
 
 if errorlevel 1 (
     echo LocalStack is not healthy. Restarting deployment/localstack...
 
-    wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout restart deployment/localstack
+    wsl -u root k3s kubectl rollout restart deployment/localstack
 
     if errorlevel 1 (
         echo ERROR: LocalStack restart command failed.
@@ -574,12 +490,12 @@ if errorlevel 1 (
         exit /b 1
     )
 
-    wsl -u root kubectl --context k3d-%K3D_CLUSTER% rollout status deployment/localstack --timeout=120s
+    wsl -u root k3s kubectl rollout status deployment/localstack --timeout=120s
 
     if errorlevel 1 (
         echo ERROR: LocalStack did not become ready after restart.
         echo.
-        wsl -u root kubectl --context k3d-%K3D_CLUSTER% get pods
+        wsl -u root k3s kubectl get pods
         pause
         exit /b 1
     )
@@ -591,48 +507,82 @@ echo.
 echo All deployments are available.
 
 echo =======================================================
-echo   Checking LocalStack (S3) for DVC Remote Storage
+echo   Preparing LocalStack (S3) and PostgreSQL Seed Data
 echo =======================================================
 echo.
 
-:: Port 4566 is already reachable at this point - k3d mapped it straight
-:: through to svc/localstack at cluster-creation time, so unlike the old
-:: kubectl port-forward setup there's no tunnel that has to exist first
-:: before setup_localstack_bucket.sh's check against 127.0.0.1:4566 works.
-taskkill /FI "WINDOWTITLE eq LocalStack S3 Console*" /F >nul 2>&1
-start "LocalStack S3 Console" wsl -u root bash -c "while true; do kubectl --context k3d-%K3D_CLUSTER% logs -f deployment/localstack; sleep 2; done"
+:: Started here (before the bootstrap check) rather than down with the other
+:: consoles - setup_localstack_and_postgres.sh checks 127.0.0.1:4566 and
+:: 127.0.0.1:5432 from inside WSL, which only resolve once these tunnels exist.
+taskkill /FI "WINDOWTITLE eq PostgreSQL Database Console*" /F >nul 2>&1
+start "PostgreSQL Database Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/postgres 5432:5432 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/postgres; sleep 2; done"
 
-wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_bucket.sh"
+taskkill /FI "WINDOWTITLE eq LocalStack S3 Console*" /F >nul 2>&1
+start "LocalStack S3 Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/localstack 4566:4566 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/localstack; sleep 2; done"
+
+wsl -u root bash -c "bash $(wslpath '%CD%')/scripts/setup_localstack_and_postgres.sh"
+if errorlevel 1 (
+    echo ERROR: LocalStack/PostgreSQL bootstrap failed. Aborting.
+    pause
+    exit /b 1
+)
+
+echo.
+echo Checking Rossmann API deployment...
+
+:: Deliberately checked here, AFTER PostgreSQL is confirmed seeded (rather
+:: than alongside the other deployments in [5/6]) - if it needs a restart,
+:: the fresh pod's own training run must see real data, not an empty
+:: database.
+wsl -u root k3s kubectl rollout status deployment/rossmann-api --timeout=10s >nul 2>&1
+
+if errorlevel 1 (
+    echo Rossmann API is not healthy. Restarting deployment/rossmann-api...
+
+    wsl -u root k3s kubectl rollout restart deployment/rossmann-api
+
+    if errorlevel 1 (
+        echo ERROR: Rossmann API restart command failed.
+        pause
+        exit /b 1
+    )
+
+    wsl -u root k3s kubectl rollout status deployment/rossmann-api --timeout=300s
+
+    if errorlevel 1 (
+        echo ERROR: Rossmann API did not become ready after restart.
+        echo.
+        wsl -u root k3s kubectl get pods
+        pause
+        exit /b 1
+    )
+) else (
+    echo Rossmann API is healthy. Skipping restart.
+)
 
 echo =======================================================
 echo   [6/6] Launching Interfaces and Live Logs
 echo =======================================================
 
 echo.
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get deployments
+wsl -u root k3s kubectl get deployments
 echo.
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get pods
+wsl -u root k3s kubectl get pods
 echo.
-wsl -u root kubectl --context k3d-%K3D_CLUSTER% get pvc
+wsl -u root k3s kubectl get pvc
 echo.
 
-:: These used to also run a "kubectl port-forward ...; sleep 3" retry loop
-:: alongside the log tail, since a port-forward tunnel dies (and has to be
-:: re-established) every time its target pod restarts. k3d's port mapping
-:: (set once at cluster-creation time) routes through the Service instead
-:: of a specific pod IP, so it survives pod restarts on its own - these
-:: consoles only need to tail logs now.
 taskkill /FI "WINDOWTITLE eq Rossmann FastAPI App Console*" /F >nul 2>&1
-start "Rossmann FastAPI App Console" wsl -u root bash -c "while true; do kubectl --context k3d-%K3D_CLUSTER% logs -f deployment/rossmann-api; sleep 2; done"
+start "Rossmann FastAPI App Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/rossmann-api-service 8000:8000 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/rossmann-api; sleep 2; done"
 
 taskkill /FI "WINDOWTITLE eq MLflow Tracking Console*" /F >nul 2>&1
-start "MLflow Tracking Console" wsl -u root bash -c "while true; do kubectl --context k3d-%K3D_CLUSTER% logs -f deployment/mlflow; sleep 2; done"
+start "MLflow Tracking Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/mlflow 5000:5000 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/mlflow; sleep 2; done"
 
 taskkill /FI "WINDOWTITLE eq Prefect Orchestration Console*" /F >nul 2>&1
-start "Prefect Orchestration Console" wsl -u root bash -c "while true; do kubectl --context k3d-%K3D_CLUSTER% logs -f deployment/prefect; sleep 2; done"
+start "Prefect Orchestration Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/prefect 4200:4200 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/prefect; sleep 2; done"
 
 taskkill /FI "WINDOWTITLE eq PostgreSQL Database Console*" /F >nul 2>&1
-start "PostgreSQL Database Console" wsl -u root bash -c "while true; do kubectl --context k3d-%K3D_CLUSTER% logs -f deployment/postgres; sleep 2; done"
+start "PostgreSQL Database Console" wsl -u root bash -c "(while true; do k3s kubectl port-forward --address 0.0.0.0 svc/postgres 5432:5432 >/dev/null 2>&1; sleep 3; done) & while true; do k3s kubectl logs -f deployment/postgres; sleep 2; done"
 
 echo.
 echo =======================================================

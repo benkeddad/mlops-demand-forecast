@@ -5,6 +5,8 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+# Dedicated venv created on-demand by scripts/setup_localstack_and_postgres.sh
+.venv-seed-db/
 
 # --- DVC ---
 # .dvc/config (the remote URL) is intentionally committed so the whole team

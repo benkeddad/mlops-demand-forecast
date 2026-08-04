@@ -44,9 +44,6 @@ feast materialize "2010-01-01T00:00:00" "2030-12-31T23:59:59"
 cd ..
 # -----------------------------
 
-echo "Loading initial raw CSV data into PostgreSQL..."
-python src/seed_db.py
-
 # --- THE DVC FIX IS HERE ---
 # The image ships a real, committed .dvc/config (S3 remote included) copied in
 # at build time, so only initialize DVC if that's somehow missing - `dvc init
@@ -77,7 +74,7 @@ if [ -n "$MLFLOW_S3_ENDPOINT_URL" ]; then
     # LocalStack has no persistence - if its pod ever gets recreated outside
     # the deploy scripts (crash-loop, manual restart, etc.), both buckets
     # vanish and training fails with NoSuchBucket. Self-heal on every boot
-    # instead of only relying on scripts/setup_localstack_bucket.sh.
+    # instead of only relying on scripts/setup_localstack_and_postgres.sh.
     python3 -c "
 import boto3
 from botocore.exceptions import ClientError

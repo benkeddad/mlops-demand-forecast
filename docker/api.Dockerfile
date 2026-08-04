@@ -25,7 +25,6 @@ COPY dvc.yaml .
 COPY .dvc/config .dvc/config
 COPY .dvcignore .
 COPY feature_repo/ feature_repo/
-COPY data/ data/
 
 # Keep the entrypoint at the same path used by the repository layout.
 # Kubernetes uses the copy stored in the image.

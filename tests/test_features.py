@@ -46,6 +46,19 @@ def test_build_features_does_not_mutate_input_frame():
     assert "Date" in df.columns  # original untouched thanks to df.copy()
 
 
+def test_build_features_normalizes_lowercase_db_columns():
+    df = pd.DataFrame({
+        "store": [1],
+        "date": ["2015-06-21"],
+        "stateholiday": ["a"],
+    })
+    result = build_features(df)
+    assert "Store" in result.columns
+    assert "Date" not in result.columns
+    assert "StateHoliday" in result.columns
+    assert result.loc[0, "StateHoliday"] == 1
+
+
 def test_feature_columns_matches_model_training_order():
     # app/main.py, src/predict_initial.py, and monitoring/drift.py all slice
     # on this exact order before calling .predict() - it must never drift.
