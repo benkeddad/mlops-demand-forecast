@@ -44,7 +44,7 @@ def seed_database(database_url: str = DATABASE_URL) -> None:
     if not TEST_CSV_PATH.exists():
         raise FileNotFoundError(f"Test CSV not found: {TEST_CSV_PATH}")
 
-    engine = create_engine(database_url)
+    engine = create_engine(database_url, connect_args={"connect_timeout": 5})
 
     with _connect_with_retry(engine) as conn:
         train_count = conn.execute(text("SELECT COUNT(*) FROM train")).scalar()

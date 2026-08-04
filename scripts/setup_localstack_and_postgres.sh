@@ -105,7 +105,12 @@ for i in $(seq 1 30); do
     # drops the very next real connection attempt (db/seed_db.py retries its
     # own connection too, as a second line of defense). The subshell closes
     # fd 3 automatically on exit, without sending any data.
-    if (exec 3<>"/dev/tcp/${POSTGRES_HOST}/${POSTGRES_PORT}") 2>/dev/null; then
+    #
+    # Wrapped in `timeout` - if something else silently swallows the SYN
+    # instead of RST'ing it (e.g. a conflicting native service reachable
+    # over a different route), plain /dev/tcp can hang for the OS's full
+    # TCP connect timeout (minutes) per attempt instead of failing fast.
+    if timeout 3 bash -c "exec 3<>\"/dev/tcp/${POSTGRES_HOST}/${POSTGRES_PORT}\"" 2>/dev/null; then
         POSTGRES_READY=1
         break
     fi
