@@ -3,14 +3,18 @@ FROM localstack/localstack:4.4.0
 WORKDIR /workspace
 
 ARG SOURCE_REPO_URL=https://github.com/benkeddad/mlops-demand-forecast.git
-ARG SOURCE_REF=main
+ARG SOURCE_COMMIT=5e8a709402beafd1238881c581f441a3171a3216
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git curl postgresql redis-server \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone only the latest snapshot to keep build time and image size lower.
-RUN git clone --depth 1 --branch ${SOURCE_REF} ${SOURCE_REPO_URL} /app
+# Clone an immutable revision so every build runs the exact same code.
+RUN git init /app \
+    && cd /app \
+    && git remote add origin ${SOURCE_REPO_URL} \
+    && git fetch --depth 1 origin ${SOURCE_COMMIT} \
+    && git checkout --detach FETCH_HEAD
 
 WORKDIR /app
 
