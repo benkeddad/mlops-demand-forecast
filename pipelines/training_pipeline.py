@@ -1,6 +1,24 @@
 import os
 import subprocess
-from prefect import flow, task
+import warnings
+
+from pydantic import PydanticDeprecatedSince20
+
+# prefect==2.14.21's own prefect/input/run_input.py defines a pydantic
+# BaseModel using the old class-based `Config` style, which fires a
+# PydanticDeprecatedSince20 warning the instant `prefect` is imported -
+# entirely inside Prefect's source, not fixable here short of bumping
+# Prefect (which requirements.txt deliberately pins against - see the
+# comment there on server-schema compatibility). Filtered before the import
+# below so it never fires in this process; the same filter also lives in
+# pytest.ini for test runs, and in app/main.py for the FastAPI process,
+# since each is a separate Python process with its own warnings state.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Support for class-based `config` is deprecated.*",
+    category=PydanticDeprecatedSince20,
+)
+from prefect import flow, task  # noqa: E402
 
 # Point to the root directory
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

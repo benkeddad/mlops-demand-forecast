@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # ==========================================
   # 1. Database & Feature Store Infrastructure
@@ -7,6 +5,25 @@ services:
   postgres:
     image: postgres:15-alpine
     container_name: rossmann_postgres
+    # Hard ceiling on top of the tuning above: if this service ever leaks or
+    # regresses, Docker kills *only this container* (visible as an OOMKilled
+    # exit) instead of the OS starting to swap/thrash across everything else
+    # sharing the WSL2 VM's memory. Honored by plain `docker compose up`
+    # (Compose V2 applies deploy.resources without needing Swarm) - verify
+    # with `docker inspect --format '{{.HostConfig.Memory}}' <container>`.
+    deploy:
+      resources:
+        limits:
+          memory: 192M
+    # postgres:15-alpine's own defaults (shared_buffers=128MB, max_connections=100)
+    # are sized for a real multi-tenant server, not four local services and one
+    # human hitting a demo stack. shared_buffers=32MB / max_connections=30 is
+    # still comfortable headroom for postgres+mlflow+prefect+feast's combined
+    # connections here, and Postgres itself won't use meaningfully more RAM
+    # than shared_buffers plus a small per-connection overhead regardless of
+    # how much host memory is available - unlike the services below, this
+    # wasn't actually variable, it just needed to be told a lower ceiling.
+    command: postgres -c shared_buffers=32MB -c max_connections=30
     # ADDED: Healthcheck to ensure Postgres is actually ready
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
@@ -32,6 +49,24 @@ services:
   redis:
     image: redis:7-alpine
     container_name: rossmann_redis
+    # Hard ceiling on top of the tuning above: if this service ever leaks or
+    # regresses, Docker kills *only this container* (visible as an OOMKilled
+    # exit) instead of the OS starting to swap/thrash across everything else
+    # sharing the WSL2 VM's memory. Honored by plain `docker compose up`
+    # (Compose V2 applies deploy.resources without needing Swarm) - verify
+    # with `docker inspect --format '{{.HostConfig.Memory}}' <container>`.
+    deploy:
+      resources:
+        limits:
+          memory: 320M
+    # Feast's online store here only ever holds the latest feature vector per
+    # store (1,115 stores, small feature set) - genuinely a few MB - so this
+    # cap is a safety ceiling, not a fix for an actual current problem. Still
+    # worth having: with no cap at all, any future change that materializes
+    # more data (or a bug that does) has nothing stopping it from growing
+    # unbounded. allkeys-lru evicts oldest-accessed keys instead of OOM-killing
+    # the container once the cap is hit.
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
     ports:
       - "6379:6379"
     networks:
@@ -41,6 +76,24 @@ services:
   localstack:
     image: localstack/localstack:4.4.0
     container_name: localstack-main
+    # Hard ceiling on top of the tuning above: if this service ever leaks or
+    # regresses, Docker kills *only this container* (visible as an OOMKilled
+    # exit) instead of the OS starting to swap/thrash across everything else
+    # sharing the WSL2 VM's memory. Honored by plain `docker compose up`
+    # (Compose V2 applies deploy.resources without needing Swarm) - verify
+    # with `docker inspect --format '{{.HostConfig.Memory}}' <container>`.
+    # Measured live (k3s, same image): steady ~139-140Mi.
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    environment:
+      # Recent LocalStack versions already lazy-load service emulators on
+      # first use rather than starting everything at boot, so this may not
+      # move the needle much by itself - but this project only ever touches
+      # S3 (DVC remote + MLflow artifact store), so being explicit costs
+      # nothing and rules out any other service ever spinning up by accident.
+      - SERVICES=s3
     ports:
       - "4566:4566"
     healthcheck:
@@ -63,6 +116,20 @@ services:
       dockerfile: docker/mlflow.Dockerfile
     # END OF CHANGE
     container_name: rossmann_mlflow
+    # Hard ceiling on top of the tuning above: if this service ever leaks or
+    # regresses, Docker kills *only this container* (visible as an OOMKilled
+    # exit) instead of the OS starting to swap/thrash across everything else
+    # sharing the WSL2 VM's memory. Honored by plain `docker compose up`
+    # (Compose V2 applies deploy.resources without needing Swarm) - verify
+    # with `docker inspect --format '{{.HostConfig.Memory}}' <container>`.
+    # 512M OOMKilled this service (confirmed live on the k3s equivalent, exit
+    # 137) even with --workers 1 above - measured real steady-state usage is
+    # ~1.5Gi once warmed up (gunicorn/uvicorn + boto3 + psycopg2's import
+    # graph, not a leak - it just never shrinks back down).
+    deploy:
+      resources:
+        limits:
+          memory: 1792M
     ports:
       - "5000:5000"
     volumes:
@@ -76,6 +143,7 @@ services:
       mlflow server
         --host 0.0.0.0
         --port 5000
+        --workers 1
         --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/mlflow
         --default-artifact-root s3://rossmann-mlflow-artifacts/mlflow-artifacts
         --allowed-hosts "*"
@@ -101,11 +169,27 @@ services:
       dockerfile: docker/prefect.Dockerfile
     # END OF CHANGE
     container_name: rossmann_prefect
+    # Hard ceiling on top of the tuning above: if this service ever leaks or
+    # regresses, Docker kills *only this container* (visible as an OOMKilled
+    # exit) instead of the OS starting to swap/thrash across everything else
+    # sharing the WSL2 VM's memory. Honored by plain `docker compose up`
+    # (Compose V2 applies deploy.resources without needing Swarm) - verify
+    # with `docker inspect --format '{{.HostConfig.Memory}}' <container>`.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     ports:
       - "4200:4200"
     environment:
       # Change 'prefect' back to 'rossmann'
       - PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/prefect
+      # Prefect leaves these unset by default, which falls through to
+      # SQLAlchemy's own defaults (pool_size=5, max_overflow=10 -> up to 15
+      # idle-capable connections held open). One human triggering one
+      # training run at a time doesn't need that; 2/3 is still safe headroom.
+      - PREFECT_SQLALCHEMY_POOL_SIZE=2
+      - PREFECT_SQLALCHEMY_MAX_OVERFLOW=3
     command: prefect server start --host 0.0.0.0
     # CHANGED: Require postgres to start first, and restart if connection fails initially
     depends_on:
@@ -126,6 +210,16 @@ services:
       context: ..
       dockerfile: docker/api.Dockerfile
     container_name: rossmann_api
+    # Hard ceiling on top of the tuning above: if this service ever leaks or
+    # regresses, Docker kills *only this container* (visible as an OOMKilled
+    # exit) instead of the OS starting to swap/thrash across everything else
+    # sharing the WSL2 VM's memory. Honored by plain `docker compose up`
+    # (Compose V2 applies deploy.resources without needing Swarm) - verify
+    # with `docker inspect --format '{{.HostConfig.Memory}}' <container>`.
+    deploy:
+      resources:
+        limits:
+          memory: 2560M
     ports:
       - "8000:8000"
     volumes:

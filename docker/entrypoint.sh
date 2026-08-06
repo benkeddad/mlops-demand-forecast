@@ -5,8 +5,63 @@ echo "========================================================"
 echo "  INITIALIZING MLOPS PIPELINE ENVIRONMENT"
 echo "========================================================"
 
-echo "Waiting 30 seconds for database and cache to initialize..."
-sleep 30
+# --- READINESS FIX ---
+# This used to be a blind `sleep 30`. That's a guess, not a check: on a
+# fresh machine's first `docker compose up --build` (cold image pulls, no
+# page cache, Postgres running its own first-boot init, Prefect's server
+# running its own DB migrations against the `prefect` database), 30 seconds
+# isn't guaranteed to be enough - and api's `depends_on` in
+# deploy/docker-compose.yaml only waits for the postgres/mlflow/prefect
+# *containers* to start, not for Postgres to accept connections or for
+# Prefect's API to actually be serving. db_bootstrap.py below has no retry
+# of its own, so a still-starting Postgres would make it fail outright -
+# and because this script runs under `set -e`, that failure would kill the
+# whole container before uvicorn ever starts. Poll for real readiness
+# instead, bounded so a genuinely broken dependency still fails loudly
+# rather than hanging forever.
+wait_for_tcp() {
+    local host="$1" port="$2" label="$3" max_tries="${4:-60}"
+    echo "Waiting for $label ($host:$port)..."
+    for i in $(seq 1 "$max_tries"); do
+        if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
+            exec 3>&- 3<&-
+            echo "$label is accepting connections."
+            return 0
+        fi
+        sleep 2
+    done
+    echo "ERROR: $label did not become reachable after $((max_tries * 2)) seconds."
+    exit 1
+}
+
+wait_for_tcp postgres 5432 "PostgreSQL"
+wait_for_tcp redis 6379 "Redis"
+
+# Prefect's server does its own DB migrations against the `prefect` Postgres
+# database on first boot before it answers requests - an open TCP port on
+# 4200 doesn't guarantee that's finished, only that the process has started
+# listening. Poll the actual health endpoint (stdlib urllib only - no curl in
+# this image) before training_pipeline.py below tries to report flow state
+# to it via PREFECT_API_URL.
+echo "Waiting for Prefect API..."
+python3 -c "
+import time
+import urllib.request
+import urllib.error
+
+url = 'http://prefect:4200/api/health'
+for i in range(60):
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            if resp.status == 200:
+                print('Prefect API is healthy.')
+                raise SystemExit(0)
+    except (urllib.error.URLError, ConnectionError, TimeoutError):
+        pass
+    time.sleep(2)
+print('ERROR: Prefect API did not become healthy after 120 seconds.')
+raise SystemExit(1)
+"
 
 # --- INDUSTRIAL PROVISIONING FIX ---
 # This ensures 'feast' and other databases exist even if volumes are pre-populated

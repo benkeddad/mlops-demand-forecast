@@ -1,12 +1,17 @@
 from datetime import timedelta
 from feast import Entity, FeatureView, Field
 from feast.types import Int64, String
+from feast.value_type import ValueType
 from feast.infra.offline_stores.contrib.postgres_offline_store.postgres_source import PostgreSQLSource
 
 # 1. Define the entity identifier used in main.py's get_online_features call
+# value_type is required as of this Feast version's next release (was
+# previously optional and inferred) - entity_id maps 1:1 from `store`
+# (an integer store number, see the query below), so INT64 is correct.
 store_entity = Entity(
-    name="entity_id", 
-    join_keys=["entity_id"]
+    name="entity_id",
+    join_keys=["entity_id"],
+    value_type=ValueType.INT64,
 )
 
 # 2. Extract raw data and compute sub-date features matching your model's inputs

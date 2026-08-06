@@ -12,8 +12,13 @@ prefect>=2.14.0,<2.15.0
 # (reorganized into the griffe top-level package), which crashes `import
 # prefect` with ModuleNotFoundError. Prefect's own setup only declares
 # griffe>=0.20.0 (no upper bound), so pip happily picks the newest 1.x
-# unless capped here.
-griffe<1.0.0
+# unless capped here. Pinned to an exact 0.x release (rather than left as
+# `<1.0.0`) because griffe 0.48+ added a deprecation shim to that same
+# `griffe.dataclasses` module ahead of the 1.0 removal - harmless, but it
+# fires a DeprecationWarning on every `import prefect` (i.e. on every test
+# run and app boot). 0.47.0 is the newest release before that shim landed,
+# still well inside Prefect's own declared floor.
+griffe==0.47.0
 # [s3] extra pulls in s3fs/aiobotocore so `dvc push`/`dvc pull` against the
 # team-shared S3 remote (.dvc/config) work without any extra install step.
 # dvc-s3/aiobotocore/botocore are pinned explicitly rather than left to the
@@ -63,5 +68,21 @@ watchdog>=3.0.0
 feast[postgres,redis]
 psycopg[binary,pool]
 asyncpg==0.29.0
-psycopg2-binary==2.9.0
-sqlalchemy==2.0.0
+
+# psycopg2-binary's 2.9.0 release (the original pin here) never published a
+# cp312 wheel - its last binary wheels stop at cp39. api.Dockerfile builds on
+# python:3.9-slim so that pin never broke the container build, but running
+# `pip install -r requirements.txt` directly on any machine with Python 3.10+
+# (which includes a stock Ubuntu 24.04 install - it ships 3.12 by default and
+# doesn't carry python3.9 in its standard repos) fails immediately: pip falls
+# back to building psycopg2 from source and dies on a missing `pg_config`
+# unless libpq-dev happens to be installed. 2.9.10 publishes wheels through
+# current Python versions and is a drop-in replacement.
+psycopg2-binary==2.9.10
+# 2.0.0 was the literal first 2.0-line release (Jan 2023). Bumped to a much
+# later 2.0.x patch - still the same major.minor line every other pin here
+# assumes, so nothing downstream changes - because 2.0.0's own DateTime type
+# code calls the now-deprecated datetime.datetime.utcfromtimestamp()
+# internally, which prints a DeprecationWarning on every run under Python
+# 3.12. Fixed upstream by 2.0.36.
+sqlalchemy==2.0.36

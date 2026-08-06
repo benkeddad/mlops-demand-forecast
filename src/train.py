@@ -1,10 +1,37 @@
 import os
+import warnings
 import pandas as pd
 import mlflow
 import mlflow.xgboost
 from data import split_data
 from model import get_model
 from evaluate import calculate_rmspe
+
+# mlflow.log_input() below always probes several dataset-source resolvers,
+# including a Databricks Unity Catalog Volume one - on any non-Databricks
+# source (this project's is s3://...) that resolver reports it can't help,
+# and mlflow surfaces that as a UserWarning. It's mlflow's own internal
+# resolver-selection mechanics, not something this project's code can
+# address - there's no s3-specific opt-out, and the alternative is dropping
+# mlflow.log_input()'s dataset-lineage tracking entirely, which is worth
+# more than the warning is worth losing.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Failed to determine whether UCVolumeDatasetSource.*",
+    category=UserWarning,
+)
+# Same reasoning for the integer-column schema-inference hint below: it's a
+# real, valid caveat in general (integer columns can't natively represent
+# missing values in schema-enforced inference), but this project's actual
+# inference path (src/predict_initial.py) already coerces every one of these
+# columns through `.fillna(0).astype(int)` before calling model.predict() -
+# the scenario this warning exists to flag is already handled upstream of
+# where it would matter.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Hint: Inferred schema contains integer column\(s\).*",
+    category=UserWarning,
+)
 
 S3_ENDPOINT = os.getenv("MLFLOW_S3_ENDPOINT_URL", "http://localhost:4566")
 S3_BUCKET = os.getenv("DVC_S3_BUCKET", "rossmann-mlops-dvc-store")
@@ -54,8 +81,14 @@ def run_training(processed_data_s3_path: str):
 
         mlflow.xgboost.log_model(
             xgb_model=model,
-            artifact_path="xgboost_model",
-            registered_model_name=REGISTERED_MODEL_NAME
+            name="xgboost_model",
+            registered_model_name=REGISTERED_MODEL_NAME,
+            signature=mlflow.models.infer_signature(X_val, predictions),
+            input_example=X_val.head(5),
+            # Silences the "saving in UBJSON by default" notice by making
+            # that same current default explicit instead of implicit -
+            # doesn't change what actually gets saved.
+            model_format="ubj",
         )
         print(f"Training completed. RMSPE: {rmspe_score:.4f}")
 

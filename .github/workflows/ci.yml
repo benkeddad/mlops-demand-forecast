@@ -16,7 +16,12 @@ jobs:
     - name: Set up Python 3.9
       uses: actions/setup-python@v4
       with:
-        python-version: "3.9"
+        # Matches docker/api.Dockerfile's base image (bumped from 3.9, which
+        # reached end-of-life in October 2025) - keeping these in sync is the
+        # whole point; CI silently sitting on a different Python version than
+        # what's actually shipped is exactly what let requirements.txt's
+        # psycopg2-binary==2.9.0 pin go unnoticed for as long as it did.
+        python-version: "3.12"
         
     - name: Install dependencies
       run: |

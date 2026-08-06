@@ -3,7 +3,22 @@ import sys
 import logging
 import asyncio
 import subprocess
+import warnings
 from contextlib import asynccontextmanager
+
+from pydantic import PydanticDeprecatedSince20
+
+# Same root cause and same reasoning as the identical filter in
+# pipelines/training_pipeline.py: this comes entirely from prefect==2.14.21's
+# own source, fires the instant prefect is imported, and this is a separate
+# Python process (uvicorn) with its own warnings state, so the filter has to
+# be repeated here rather than just relying on the one in training_pipeline.py.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Support for class-based `config` is deprecated.*",
+    category=PydanticDeprecatedSince20,
+)
+
 import mlflow.pyfunc
 import pandas as pd
 from fastapi import FastAPI, HTTPException

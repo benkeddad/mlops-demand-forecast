@@ -1,4 +1,16 @@
-FROM python:3.9-slim
+# Python 3.9 reached end-of-life in October 2025 - besides the security-patch
+# exposure that comes with staying on it, it was also the direct cause of
+# most of the warning noise this image used to print at boot:
+#   - boto3 itself now warns on every run that Python 3.9 support is ending
+#   - matplotlib (pulled in transitively by evidently) hasn't shipped a
+#     Python 3.9 wheel since 3.9.4 (mid-2024), so pip was stuck resolving
+#     that old release - which still calls pyparsing's now-deprecated
+#     camelCase API (oneOf/parseString/resetCache/enablePackrat), firing a
+#     PyparsingDeprecationWarning on every single matplotlib import. 3.12
+#     resolves to current matplotlib (3.11.1+), which doesn't have this
+#     problem. requirements.txt's psycopg2-binary pin was verified to still
+#     ship a cp312 wheel, so this doesn't reopen that earlier issue.
+FROM python:3.12-slim
 
 WORKDIR /app
 

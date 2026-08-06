@@ -119,6 +119,22 @@ resource "kubernetes_deployment" "localstack" {
           image              = "localstack/localstack:4.4.0"
           image_pull_policy  = "IfNotPresent"
 
+          # No requests/limits existed on any container in this module before -
+          # meaning every pod could grow unbounded, and the scheduler had no
+          # actual number to reason about when placing pods on the node.
+          # requests = what's guaranteed at scheduling time, limits = hard
+          # ceiling (OOMKilled past this). Measured live via `kubectl top pod`
+          # across a full pipeline run: steady ~139-140Mi (only S3 emulation
+          # is enabled, see SERVICES=s3 below) - tightened from a 512Mi guess.
+          resources {
+            requests = {
+              memory = "128Mi"
+            }
+            limits = {
+              memory = "256Mi"
+            }
+          }
+
           port {
             container_port = 4566
           }
@@ -249,6 +265,23 @@ resource "kubernetes_deployment" "postgres" {
           image = "postgres:15-alpine"
           image_pull_policy = "IfNotPresent"
 
+          # No requests/limits existed on any container in this module before -
+          # meaning every pod could grow unbounded, and the scheduler had no
+          # actual number to reason about when placing pods on the node.
+          # requests = what's guaranteed at scheduling time, limits = hard
+          # ceiling (OOMKilled past this). Live-observed RSS is ~172Mi against
+          # Postgres's own defaults (shared_buffers=128MB, no tuning applied
+          # here unlike Compose's -c flags) - the original 192Mi limit left
+          # almost no headroom, bumped for real safety margin.
+          resources {
+            requests = {
+              memory = "128Mi"
+            }
+            limits = {
+              memory = "256Mi"
+            }
+          }
+
           env {
             name = "POSTGRES_USER"
             value_from {
@@ -361,6 +394,22 @@ resource "kubernetes_deployment" "redis" {
           image = "redis:7-alpine"
           image_pull_policy = "IfNotPresent"
 
+          # No requests/limits existed on any container in this module before -
+          # meaning every pod could grow unbounded, and the scheduler had no
+          # actual number to reason about when placing pods on the node.
+          # requests = what's guaranteed at scheduling time, limits = hard
+          # ceiling (OOMKilled past this). Sized to roughly match the tuning
+          # applied on the Compose side (deploy/docker-compose.yaml) for the
+          # same services.
+          resources {
+            requests = {
+              memory = "160Mi"
+            }
+            limits = {
+              memory = "320Mi"
+            }
+          }
+
           port {
             container_port = 6379
           }
@@ -442,6 +491,27 @@ resource "kubernetes_deployment" "mlflow" {
           image = "rossmann-mlflow:latest"
           # END OF CHANGE
           image_pull_policy = "IfNotPresent"
+
+          # No requests/limits existed on any container in this module before -
+          # meaning every pod could grow unbounded, and the scheduler had no
+          # actual number to reason about when placing pods on the node.
+          # requests = what's guaranteed at scheduling time, limits = hard
+          # ceiling (OOMKilled past this). 512Mi and 1024Mi both OOMKilled
+          # this pod even with --workers 1 (confirmed live: exit 137 at
+          # each). Measured its real steady-state footprint via repeated
+          # `kubectl top pod` samples across several training runs: holds
+          # flat at ~1552-1553Mi once warmed up (gunicorn/uvicorn + boto3 +
+          # psycopg2's import graph, not a leak - it just never shrinks back
+          # down). Sized to that measured number plus a real but modest
+          # margin, not another guess.
+          resources {
+            requests = {
+              memory = "1536Mi"
+            }
+            limits = {
+              memory = "1792Mi"
+            }
+          }
           
           # Claude changed: the connection string is now read from the Secret
           # via an env var, then referenced in args with Kubernetes' native
@@ -500,6 +570,10 @@ resource "kubernetes_deployment" "mlflow" {
             "mlflow", "server",
             "--host", "0.0.0.0",
             "--port", "5000",
+            # Matches deploy/docker-compose.yaml's mlflow command - caps gunicorn
+            # to a single worker instead of its multi-worker default, which is
+            # what was actually blowing past the (now raised) memory limit above.
+            "--workers", "1",
             "--backend-store-uri", "$(MLFLOW_BACKEND_STORE_URI)",
             "--default-artifact-root", "s3://rossmann-mlflow-artifacts/mlflow-artifacts",
             "--allowed-hosts", "*"
@@ -598,6 +672,22 @@ resource "kubernetes_deployment" "prefect" {
           image = "rossmann-prefect:latest"
           # END OF CHANGE
           image_pull_policy = "IfNotPresent"
+
+          # No requests/limits existed on any container in this module before -
+          # meaning every pod could grow unbounded, and the scheduler had no
+          # actual number to reason about when placing pods on the node.
+          # requests = what's guaranteed at scheduling time, limits = hard
+          # ceiling (OOMKilled past this). Sized to roughly match the tuning
+          # applied on the Compose side (deploy/docker-compose.yaml) for the
+          # same services.
+          resources {
+            requests = {
+              memory = "256Mi"
+            }
+            limits = {
+              memory = "512Mi"
+            }
+          }
           
           args = ["prefect", "server", "start", "--host", "0.0.0.0"]
 
@@ -690,6 +780,26 @@ resource "kubernetes_deployment" "api" {
           image = "rossmann-api:latest"
           
           image_pull_policy = "IfNotPresent"
+
+          # No requests/limits existed on any container in this module before -
+          # meaning every pod could grow unbounded, and the scheduler had no
+          # actual number to reason about when placing pods on the node.
+          # requests = what's guaranteed at scheduling time, limits = hard
+          # ceiling (OOMKilled past this). 896Mi, then 1280Mi (based on
+          # `kubectl top pod` sampling) both still OOMKilled this pod
+          # (confirmed live: exit 137 at each) - point-in-time sampling missed
+          # the real peak between polls. Temporarily generous again while the
+          # true peak is measured properly via the container's own cgroup v2
+          # `memory.peak` counter (monotonic high-water mark, immune to
+          # sampling gaps), not `kubectl top pod` snapshots.
+          resources {
+            requests = {
+              memory = "640Mi"
+            }
+            limits = {
+              memory = "2560Mi"
+            }
+          }
 
           port {
             container_port = 8000

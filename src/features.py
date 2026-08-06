@@ -45,9 +45,16 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df = _canonicalize_columns(df)
     if "Date" in df.columns:
         dt = pd.to_datetime(df["Date"])
-        df["Year"]  = dt.dt.year
-        df["Month"] = dt.dt.month
-        df["Day"]   = dt.dt.day
+        # .dt.year/.month/.day are int32 by default, but predict_initial.py's
+        # blanket `.astype(int)` on serving input produces int64 - mismatched
+        # dtypes are invisible until something enforces a schema. Forcing
+        # int64 here (matching every other integer column already produced
+        # from Store/DayOfWeek/etc.) keeps train-time and serving-time
+        # dtypes identical so mlflow's logged model signature (added in
+        # src/train.py) doesn't reject real inference input.
+        df["Year"]  = dt.dt.year.astype("int64")
+        df["Month"] = dt.dt.month.astype("int64")
+        df["Day"]   = dt.dt.day.astype("int64")
         df.drop(columns=["Date"], inplace=True)
 
     if "StateHoliday" in df.columns:
