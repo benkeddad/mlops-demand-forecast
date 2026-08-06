@@ -1,3 +1,12 @@
+---
+title: Rossmann Demand Forecasting
+emoji: 📈
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+---
+
 # Rossmann Demand Forecasting — Event-Driven MLOps Platform
 
 <p align="left">

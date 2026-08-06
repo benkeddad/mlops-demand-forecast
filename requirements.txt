@@ -55,6 +55,9 @@ fastapi>=0.100.0
 uvicorn>=0.22.0
 pydantic>=2.0.0
 python-multipart>=0.0.6
+# Already pulled in transitively by mlflow, pinned explicitly here since
+# app/routers/system.py imports it directly for the /metrics endpoint.
+prometheus-client>=0.20.0
 
 # --- Monitoring ---
 # Claude modified this line: pinned an upper bound. monitoring/drift.py parses

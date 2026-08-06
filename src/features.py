@@ -7,6 +7,10 @@ _HOLIDAY_MAP = {"0": 0, "a": 1, "b": 2, "c": 3}
 
 S3_ENDPOINT = os.getenv("MLFLOW_S3_ENDPOINT_URL", "http://localhost:4566")
 S3_BUCKET = os.getenv("DVC_S3_BUCKET", "rossmann-mlops-dvc-store")
+# Overridable so this same script can target a plain local directory instead
+# of S3 (e.g. Hugging Face Spaces, which has no Docker-in-Docker access for
+# LocalStack) - defaults to today's S3 path, unchanged for k3s/Compose.
+DATA_STORAGE_ROOT = os.getenv("DATA_STORAGE_ROOT", f"s3://{S3_BUCKET}/processed-data")
 
 _COLUMN_CANONICAL_NAMES = {
     "store": "Store",
@@ -22,6 +26,8 @@ _COLUMN_CANONICAL_NAMES = {
 }
 
 def get_storage_options():
+    if not DATA_STORAGE_ROOT.startswith("s3://"):
+        return {}
     return {
         "key": os.getenv("AWS_ACCESS_KEY_ID", "test"),
         "secret": os.getenv("AWS_SECRET_ACCESS_KEY", "test"),
@@ -72,8 +78,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 if __name__ == "__main__":
     print("Running Feature Engineering...")
-    input_s3_path = f"s3://{S3_BUCKET}/processed-data/clean_data.parquet"
-    output_s3_path = f"s3://{S3_BUCKET}/processed-data/train_features.parquet"
+    input_s3_path = f"{DATA_STORAGE_ROOT}/clean_data.parquet"
+    output_s3_path = f"{DATA_STORAGE_ROOT}/train_features.parquet"
 
     # Read input direct from S3
     clean_df = pd.read_parquet(input_s3_path, storage_options=get_storage_options())
