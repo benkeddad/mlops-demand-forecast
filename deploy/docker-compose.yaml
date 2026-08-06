@@ -5,13 +5,16 @@ services:
   postgres:
     image: postgres:15-alpine
     container_name: rossmann_postgres
-    # ADDED: Healthcheck to ensure Postgres is actually ready
+    deploy:
+      resources:
+        limits:
+          memory: 192M
+    command: postgres -c shared_buffers=32MB -c max_connections=30
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
-    # END OF CHANGE
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -19,26 +22,34 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      # Claude modified these two lines: init scripts moved to db/, this file moved to deploy/, so ../db/
       - ../db/create-databases.sql:/docker-entrypoint-initdb.d/create-databases.sql
       - ../db/init.sql:/docker-entrypoint-initdb.d/init.sql
       - postgres_data:/var/lib/postgresql/data
-
     networks:
       - rossmann_network
 
   redis:
     image: redis:7-alpine
     container_name: rossmann_redis
+    deploy:
+      resources:
+        limits:
+          memory: 320M
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
     ports:
       - "6379:6379"
     networks:
       - rossmann_network
 
-  # Plain community image (no LOCALSTACK_AUTH_TOKEN) - S3 is a free-tier service.
   localstack:
     image: localstack/localstack:4.4.0
     container_name: localstack-main
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    environment:
+      - SERVICES=s3
     ports:
       - "4566:4566"
     healthcheck:
@@ -50,17 +61,17 @@ services:
       - rossmann_network
 
   # ==========================================
-  # 2. Orchestration & Tracking 
+  # 2. Orchestration & Tracking
   # ==========================================
   mlflow:
-    # CHANGED: Build local custom image with database driver instead of pulling upstream image
-    # Claude modified this block: context is now ".." (repo root) since this compose file
-    # lives in deploy/, and the Dockerfile moved to docker/
     build:
       context: ..
       dockerfile: docker/mlflow.Dockerfile
-    # END OF CHANGE
     container_name: rossmann_mlflow
+    deploy:
+      resources:
+        limits:
+          memory: 1792M
     ports:
       - "5000:5000"
     volumes:
@@ -74,43 +85,39 @@ services:
       mlflow server
         --host 0.0.0.0
         --port 5000
+        --workers 1
         --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/mlflow
         --default-artifact-root s3://rossmann-mlflow-artifacts/mlflow-artifacts
         --allowed-hosts "*"
-    # CHANGED: Require postgres to start first, and restart if connection fails initially
-    # Claude modified this block: switched to the same health-gated condition prefect already
-    # uses below, so both services wait for Postgres to actually accept connections, not just start
     depends_on:
       postgres:
         condition: service_healthy
       localstack:
         condition: service_healthy
     restart: on-failure:5
-    # END OF CHANGE
     networks:
       - rossmann_network
 
   prefect:
-    # CHANGED: Build local custom image with database driver instead of pulling upstream image
-    # Claude modified this block: context is now ".." (repo root) since this compose file
-    # lives in deploy/, and the Dockerfile moved to docker/
     build:
       context: ..
       dockerfile: docker/prefect.Dockerfile
-    # END OF CHANGE
     container_name: rossmann_prefect
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     ports:
       - "4200:4200"
     environment:
-      # Change 'prefect' back to 'rossmann'
       - PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/prefect
+      - PREFECT_SQLALCHEMY_POOL_SIZE=2
+      - PREFECT_SQLALCHEMY_MAX_OVERFLOW=3
     command: prefect server start --host 0.0.0.0
-    # CHANGED: Require postgres to start first, and restart if connection fails initially
     depends_on:
       postgres:
         condition: service_healthy
     restart: on-failure:5
-    # END OF CHANGE
     networks:
       - rossmann_network
 
@@ -118,34 +125,28 @@ services:
   # 3. Application Layer
   # ==========================================
   api:
-    # Claude modified this block: context is now ".." (repo root), and the Dockerfile
-    # moved to docker/api.Dockerfile (was the unnamed root Dockerfile)
     build:
       context: ..
       dockerfile: docker/api.Dockerfile
     container_name: rossmann_api
+    deploy:
+      resources:
+        limits:
+          memory: 2560M
     ports:
       - "8000:8000"
     volumes:
-      # Claude modified this line: was "- .:/app" - "." now means deploy/, so it must be ".."
-      # to keep bind-mounting the actual repo root for live hot-reload
       - ..:/app
       - mlflow_data:/mlflow
     working_dir: /app
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/rossmann
-      # NEW: raw (not pre-composed) Postgres creds - feature_repo/feature_store.yaml
-      # uses ${POSTGRES_USER}/${POSTGRES_PASSWORD} substitution (a Feast-native
-      # feature), which needs these as real env vars, not just folded into DATABASE_URL.
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - MODEL_URI=models:/Rossmann_XGBoost_Model/latest
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - PREFECT_API_URL=http://prefect:4200/api
       - WATCHFILES_FORCE_POLLING=true
-      # NEW: same S3/LocalStack credentials as mlflow - mlflow.pyfunc.load_model()
-      # resolves a models:/... URI into a real s3://... artifact path via the
-      # tracking server, then downloads it client-side using these.
       - MLFLOW_S3_ENDPOINT_URL=http://localstack:4566
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}

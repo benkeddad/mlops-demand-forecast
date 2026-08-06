@@ -1,3 +1,12 @@
+---
+title: Rossmann Demand Forecasting
+emoji: 📈
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+---
+
 # Rossmann Demand Forecasting — Event-Driven MLOps Platform
 
 <p align="left">
@@ -135,7 +144,7 @@ Both deployment scripts publish the same host ports, so only one stack runs at a
 | Production-representative orchestration | Kubernetes (K3s) via Terraform (`hashicorp/kubernetes`) |
 | Ingress / TLS | Traefik + self-signed cert via `hashicorp/tls` |
 | CI/CD | GitHub Actions — lint + test on push/PR, scheduled drift check |
-| Testing | pytest, 31 unit tests across 7 modules |
+| Testing | pytest, 44 unit tests across API, data, model, pipeline, and router modules |
 
 ## Repository structure
 
@@ -181,7 +190,7 @@ Both deployment scripts publish the same host ports, so only one stack runs at a
 │   ├── deploy_k3s_reconcile_wsl.bat
 │   ├── install_terraform.sh
 │   └── setup_localstack_and_postgres.sh   # LocalStack buckets + Postgres seeding, run once per deploy before the API starts
-├── tests/                       # 31 unit tests — data, features, model, evaluate, db_bootstrap, serve_deployment, training_pipeline
+├── tests/                       # 44 unit tests — data, features, model, evaluate, bootstrap, pipeline, auth, state, and router coverage
 ├── .github/workflows/
 │   ├── ci.yml                   # flake8 + pytest on push/PR to main
 │   └── drift-monitoring.yml     # Scheduled drift check with an isolated Postgres service container
@@ -311,14 +320,28 @@ Each deploy script opens a live log/port-forward console per service, and safely
 
 ## API reference
 
+Set `API_KEY` to protect write/control endpoints. Clients then send `X-API-Key: <value>`.
+If `API_KEY` is unset, control endpoints are open (local/dev mode).
+
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/` | Redirects to `/docs` |
 | `GET` | `/docs` | Interactive Swagger UI |
 | `GET` | `/health` | API and model-load status |
+| `GET` | `/live` | Lightweight process liveness check |
+| `GET` | `/ready` | Readiness check (model loaded + DB reachable) |
+| `GET` | `/metrics` | Prometheus metrics for request count/latency and service health |
 | `GET` | `/predict/realtime/{store_id}` | Real-time inference via the Feast/Redis online store |
+| `GET` | `/models` | Registered models overview from MLflow |
+| `GET` | `/models/current` | Currently loaded serving model details |
+| `GET` | `/training/runs` | Prefect flow-run list |
+| `GET` | `/data/stats` | Data coverage and row-count stats from Postgres |
+| `GET` | `/data/predictions` | Paginated prediction records |
 | `POST` | `/trigger-training` | Manually fires the Prefect training deployment |
 | `POST` | `/reload-model` | Reloads the latest registered model from MLflow without retraining |
+| `POST` | `/models/{name}/versions/{version}/promote` | Promote a model version alias in MLflow |
+| `POST` | `/models/rollback/{version}` | Roll API serving back to a specific version |
+| `POST` | `/training/runs/{id}/cancel` | Cancel a running Prefect flow run |
 
 ## Testing & CI
 
@@ -326,7 +349,7 @@ Each deploy script opens a live log/port-forward console per service, and safely
 pytest -v
 ```
 
-31 unit tests across `tests/`, covering the DVC data split, feature engineering (date decomposition, holiday-code mapping, leakage-column drops, lowercase-column normalization from Postgres), the RMSPE metric, the model factory, database bootstrapping, the Prefect deployment registration, and every stage of the training pipeline (including the LocalStack S3 endpoint wiring DVC subprocesses need). `pytest.ini` sets `pythonpath = . src pipelines` so both repo-root-style imports (used by `app/main.py`, `monitoring/drift.py`) and script-style imports (used when DVC or Prefect run a module directly) resolve identically under test.
+44 unit tests across `tests/`, covering data split/ingest, feature engineering and dtype consistency, model/evaluation behavior, DB bootstrapping, Prefect deployment registration, training pipeline stages, API auth/state helpers, and the new observability/control routers for models, training, and data endpoints. `pytest.ini` sets `pythonpath = . src pipelines` so both repo-root-style imports (used by `app/main.py`, `monitoring/drift.py`) and script-style imports (used when DVC or Prefect run a module directly) resolve identically under test.
 
 - **`ci.yml`** — flake8 (syntax/undefined-name errors only, across `src`, `app`, `pipelines`, and `db`) + the full pytest suite, on every push and PR to `main`.
 - **`drift-monitoring.yml`** — runs daily at 06:00 UTC against a disposable Postgres service container seeded from the same schema and CSVs the real stack uses, so it's a genuine drift check rather than a placeholder. On significant drift it fails the job and, if `RETRAIN_TRIGGER_URL` is set, calls a deployed instance's `/trigger-training` endpoint.
@@ -335,7 +358,7 @@ pytest -v
 
 Documented deliberately rather than discovered by a reviewer:
 
-- **`/trigger-training` has no authentication in front of it.** Fine for local/demo use; anything internet-reachable needs an API key, mTLS, or a network policy in front of it first.
+- **Auth is optional by environment.** Write/control endpoints are protected only when `API_KEY` is set; if it is unset, those endpoints are intentionally open for local/demo use.
 - **The K3s ingress TLS cert is self-signed**, generated fresh by Terraform on every `apply`. Good enough for local HTTPS termination through Traefik; swap for a `cert-manager`-issued or CA-signed cert before exposing this beyond a local demo.
 - **LocalStack has no persistence.** All three S3 buckets/prefixes are recreated on every deploy (`scripts/setup_localstack_and_postgres.sh` self-heals them, and `docker/entrypoint.sh` self-heals the DVC-relevant ones as a second line of defense); this is fine for demo artifacts, not a substitute for real S3.
 - **DVC's `processed-data` stage outputs are declared `cache: false`.** Since DVC 3.x doesn't support caching external (`s3://`) outputs, these are the pipeline's real, authoritative tracked outputs — not a local cache with an S3 mirror bolted on. An S3 outage during `ingest`/`featurize` fails that stage outright, by design.
@@ -356,4 +379,4 @@ Building and hardening it end-to-end involved developing/demonstrating:
 - **Root-causing distributed-systems failures, not just symptoms** — diagnosing and fixing a live race condition between database seeding and API startup, and tracing an intermittent connection failure all the way through a Kubernetes ServiceLB hostPort binding to confirm the actual root cause with controlled, repeatable tests rather than guesswork.
 - **Security-conscious defaults** — credentials delivered via Kubernetes `Secret` objects and `secret_key_ref`, never inlined into manifests, with real TLS termination in front of every UI.
 - **Operational monitoring** — closing the loop with automated, scheduled drift detection that can trigger retraining on its own, with its own audit trail in MLflow.
-- **Test-driven infrastructure code** — 31 unit tests covering not just model logic but the orchestration/pipeline code itself, enforced in CI on every push.
+- **Test-driven infrastructure code** — 44 unit tests covering not just model logic but orchestration/pipeline and operational API code, enforced in CI on every push.

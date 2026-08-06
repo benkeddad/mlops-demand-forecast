@@ -3,10 +3,25 @@ import sys
 import logging
 import asyncio
 import subprocess
+import warnings
 from contextlib import asynccontextmanager
-import mlflow.pyfunc
+
+from pydantic import PydanticDeprecatedSince20
+
+# Same root cause and same reasoning as the identical filter in
+# pipelines/training_pipeline.py: this comes entirely from prefect==2.14.21's
+# own source, fires the instant prefect is imported, and this is a separate
+# Python process (uvicorn) with its own warnings state, so the filter has to
+# be repeated here rather than just relying on the one in training_pipeline.py.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Support for class-based `config` is deprecated.*",
+    category=PydanticDeprecatedSince20,
+)
+
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+import time
+from fastapi import FastAPI, HTTPException, Depends, Request
 import asyncpg
 from feast import FeatureStore
 from fastapi.responses import StreamingResponse, RedirectResponse
@@ -20,6 +35,10 @@ if project_root not in sys.path:
 
 # 2. Now you can import from the 'src' folder directly
 from src.features import build_features
+from app import state
+from app.auth import require_api_key
+from app.routers import data as data_router, models as models_router, system as system_router, training as training_router
+from app.routers.system import REQUEST_COUNT, REQUEST_LATENCY
 
 # ---------------------------------------------------------------------------
 # Config & State
@@ -27,9 +46,7 @@ from src.features import build_features
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("sales_api")
 
-MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
-MODEL_URI = os.getenv("MODEL_URI", "models:/Rossmann_XGBoost_Model/latest")
-DB_URL = os.getenv("DATABASE_URL", "postgresql://user:Password@localhost:5432/rossmann")
+DB_URL = state.DB_URL
 
 # Claude added: the Prefect Deployment pipelines/serve_deployment.py registers
 # at API startup - "<flow name>/<deployment name>" is how run_deployment()
@@ -37,15 +54,14 @@ DB_URL = os.getenv("DATABASE_URL", "postgresql://user:Password@localhost:5432/ro
 PREFECT_DEPLOYMENT_NAME = "Rossmann-Enterprise-Pipeline/production"
 _deployment_server_process = None
 
-mlflow.set_tracking_uri(MLFLOW_URI)
-_model = None
 feast_store = FeatureStore(repo_path="feature_repo")
 
 # ---------------------------------------------------------------------------
 # The Shared Prediction Logic (Source of Truth)
 # ---------------------------------------------------------------------------
 async def perform_batch_prediction():
-    if _model is None:
+    model = state.get_model()
+    if model is None:
         logger.warning("Prediction skipped: No model loaded.")
         return
 
@@ -94,7 +110,7 @@ async def perform_batch_prediction():
         features_only = features_only.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
         
         # 7. Predict
-        predictions = _model.predict(features_only)
+        predictions = model.predict(features_only)
         
         # 8. Check if predictions are all the same (The Debugger)
         if len(set(predictions)) == 1:
@@ -120,16 +136,6 @@ async def perform_batch_prediction():
 # ---------------------------------------------------------------------------
 # Loaders & Triggers
 # ---------------------------------------------------------------------------
-def _load_model() -> bool:
-    global _model
-    try:
-        _model = mlflow.pyfunc.load_model(MODEL_URI)
-        logger.info("Model loaded successfully.")
-        return True
-    except Exception as e:
-        logger.error(f"Load failed: {e}")
-        return False
-
 async def wait_and_reload_deployment_run(flow_run_id):
     """Polls the Prefect server until the given flow run reaches a terminal
     state, then reloads the model and fires a batch-prediction pass - the
@@ -143,7 +149,7 @@ async def wait_and_reload_deployment_run(flow_run_id):
 
     logger.info(f"Training flow run {flow_run_id} finished ({flow_run.state.name}).")
     if flow_run.state.is_completed():
-        if _load_model():
+        if state.load_model():
             logger.info("Triggering post-training batch prediction...")
             asyncio.create_task(perform_batch_prediction())
     else:
@@ -187,7 +193,7 @@ async def run_postgres_event_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _deployment_server_process
-    _load_model()
+    state.load_model()
     # Long-lived Prefect Deployment server (see pipelines/serve_deployment.py):
     # registers the "production" deployment once, then polls the Prefect
     # server for the rest of this process's life for scheduled and/or
@@ -201,21 +207,37 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Sales Forecasting API", lifespan=lifespan)
 
+
+@app.middleware("http")
+async def prometheus_metrics_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    path = request.scope.get("route").path if request.scope.get("route") else request.url.path
+    REQUEST_LATENCY.labels(request.method, path).observe(time.perf_counter() - start)
+    REQUEST_COUNT.labels(request.method, path, response.status_code).inc()
+    return response
+
+
+app.include_router(system_router.router)
+app.include_router(models_router.router)
+app.include_router(data_router.router)
+app.include_router(training_router.router)
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
-@app.post("/reload-model", summary="Force a model reload now")
+@app.post("/reload-model", summary="Force a model reload now", dependencies=[Depends(require_api_key)])
 def reload_model():
-    success = _load_model()
+    success = state.load_model()
     if success:
-        return {"status": "Model reloaded successfully.", "model_uri": MODEL_URI}
+        return {"status": "Model reloaded successfully.", "model_uri": state.get_model_uri()}
     raise HTTPException(
         status_code=503,
         detail={"error": "Reload failed.", "reason": "Model loading encountered an error"},
     )
 
-@app.post("/trigger-training", summary="Manually trigger a Prefect training run")
+@app.post("/trigger-training", summary="Manually trigger a Prefect training run", dependencies=[Depends(require_api_key)])
 async def trigger_training():
     """
     Fires the same Prefect Deployment run the Postgres train_changed trigger
@@ -238,7 +260,8 @@ async def predict_realtime(store_id: int):
     Retrieves the latest pre-computed features for a single store from Redis 
     via Feast in <10ms, then runs live model inference.
     """
-    if _model is None:
+    model = state.get_model()
+    if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded.")
     
     try:
@@ -278,7 +301,7 @@ async def predict_realtime(store_id: int):
         features_only = features_only.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
         
         # 4. Run real-time inference on the fetched features
-        prediction = _model.predict(features_only)[0]
+        prediction = model.predict(features_only)[0]
         
         return {
             "store_id": store_id,
@@ -296,7 +319,7 @@ async def predict_realtime(store_id: int):
 
 @app.get("/health", summary="Check API and Model status")
 def health_check():
-    return {"status": "API active", "model_loaded": _model is not None}
+    return {"status": "API active", "model_loaded": state.get_model() is not None}
 
 @app.get("/", include_in_schema=False)
 def redirect_to_docs():
