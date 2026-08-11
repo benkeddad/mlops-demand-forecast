@@ -3,7 +3,7 @@ FROM localstack/localstack:4.4.0
 WORKDIR /workspace
 
 ARG SOURCE_REPO_URL=https://github.com/benkeddad/mlops-demand-forecast.git
-ARG SOURCE_COMMIT=5e8a709402beafd1238881c581f441a3171a3216
+ARG SOURCE_REF=main
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git curl postgresql redis-server \

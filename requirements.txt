@@ -67,6 +67,19 @@ evidently>=0.4.0,<0.7.0
 # --- Development & Background Tasks ---
 watchdog>=3.0.0
 
+# --- Testing ---
+# Not a direct project dependency - pulled in transitively by prefect
+# (httpx>=0.23, no upper bound) purely because tests/*.py use
+# `starlette.testclient.TestClient`, which requires httpx to be installed.
+# Left unpinned, pip resolves the newest httpx release. httpx 0.28 dropped
+# the deprecated `app=` shortcut from `Client.__init__` entirely, but this
+# project's resolved starlette (0.32.0.post1, from fastapi>=0.100.0) still
+# calls `super().__init__(app=self.app, ...)` inside TestClient.__init__ -
+# so `TestClient(app)` raises `TypeError: Client.__init__() got an
+# unexpected keyword argument 'app'` at import time, aborting pytest
+# collection for every router test module. Any 0.27.x release works.
+httpx<0.28
+
 
 feast[postgres,redis]
 psycopg[binary,pool]

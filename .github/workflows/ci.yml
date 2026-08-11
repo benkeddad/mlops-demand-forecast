@@ -28,6 +28,15 @@ jobs:
         python -m pip install --upgrade pip
         pip install flake8 pytest
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        # evidently<0.7.0 unconditionally pulls in litestar, which
+        # unconditionally requires the unrelated `multipart` PyPI package -
+        # it clobbers python-multipart's same-named importable module on
+        # disk (see docker/api.Dockerfile for the full explanation), which
+        # crashes pytest collection on any router module using
+        # UploadFile/File. Force python-multipart back after the main
+        # install, regardless of which one the resolver installed last.
+        pip uninstall -y multipart
+        pip install --no-cache-dir --force-reinstall --no-deps python-multipart
         
     - name: Lint with flake8
       run: |
