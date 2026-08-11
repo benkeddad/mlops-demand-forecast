@@ -328,11 +328,18 @@ If `API_KEY` is unset, control endpoints are open (local/dev mode).
 | `GET` | `/training/runs` | Prefect flow-run list |
 | `GET` | `/data/stats` | Data coverage and row-count stats from Postgres |
 | `GET` | `/data/predictions` | Paginated prediction records |
+| `GET` | `/query/schema` | List queryable tables and columns |
+| `GET` | `/query/run` | Run a read-only SQL query (`SELECT`/`WITH`) against the database |
+| `GET` | `/query/download` | Run a read-only SQL query and download the result as CSV |
 | `POST` | `/trigger-training` | Manually fires the Prefect training deployment |
 | `POST` | `/reload-model` | Reloads the latest registered model from MLflow without retraining |
+| `POST` | `/data/upload/train` | Upload a CSV and append it to `train` - control action |
+| `POST` | `/data/upload/test` | Upload a CSV and append it to `test` - control action |
 | `POST` | `/models/{name}/versions/{version}/promote` | Promote a model version alias in MLflow |
 | `POST` | `/models/rollback/{version}` | Roll API serving back to a specific version |
 | `POST` | `/training/runs/{id}/cancel` | Cancel a running Prefect flow run |
+
+`/query/*` is intentionally read-only - it rejects anything that isn't a single `SELECT`/`WITH ... SELECT` statement (no `;`-chained statements, no `INSERT`/`UPDATE`/`DELETE`/`DROP`/etc.), and every result is capped at 5,000 rows regardless of what the query itself requests, since `train` alone is 1M+ rows and there's no pagination. Writes only ever happen through `/data/upload/*`, which stay behind `API_KEY` like the other control endpoints - and because both endpoints load via Postgres `COPY`, the same `train_changed`/`test_inserted` triggers described above fire for an uploaded CSV exactly as they would for any other insert, so a bulk upload flows into the same closed loop without any extra wiring.
 
 ## Testing & CI
 
@@ -340,7 +347,7 @@ If `API_KEY` is unset, control endpoints are open (local/dev mode).
 pytest -v
 ```
 
-44 unit tests across `tests/`, covering data split/ingest, feature engineering and dtype consistency, model/evaluation behavior, DB bootstrapping, Prefect deployment registration, training pipeline stages, API auth/state helpers, and the new observability/control routers for models, training, and data endpoints. `pytest.ini` sets `pythonpath = . src pipelines` so both repo-root-style imports (used by `app/main.py`, `monitoring/drift.py`) and script-style imports (used when DVC or Prefect run a module directly) resolve identically under test.
+57 unit tests across `tests/`, covering data split/ingest, feature engineering and dtype consistency, model/evaluation behavior, DB bootstrapping, Prefect deployment registration, training pipeline stages, API auth/state helpers, and the observability/control routers for models, training, data (incl. CSV upload), and the read-only query console. `pytest.ini` sets `pythonpath = . src pipelines` so both repo-root-style imports (used by `app/main.py`, `monitoring/drift.py`) and script-style imports (used when DVC or Prefect run a module directly) resolve identically under test.
 
 - **`ci.yml`** — flake8 (syntax/undefined-name errors only, across `src`, `app`, `pipelines`, and `db`) + the full pytest suite, on every push and PR to `main`.
 - **`drift-monitoring.yml`** — runs daily at 06:00 UTC against a disposable Postgres service container seeded from the same schema and CSVs the real stack uses, so it's a genuine drift check rather than a placeholder. On significant drift it fails the job and, if `RETRAIN_TRIGGER_URL` is set, calls a deployed instance's `/trigger-training` endpoint.

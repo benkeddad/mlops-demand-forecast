@@ -19,7 +19,12 @@ RUN git init /app \
 WORKDIR /app
 
 RUN pip3 install --no-cache-dir --upgrade pip \
-    && pip3 install --no-cache-dir -r requirements.txt
+    && pip3 install --no-cache-dir -r requirements.txt \
+    # See docker/api.Dockerfile for why: evidently<0.7.0 -> litestar -> the
+    # unrelated `multipart` package clobbers python-multipart's same-named
+    # module on disk, breaking any UploadFile/File route unless forced back.
+    && pip3 uninstall -y multipart \
+    && pip3 install --no-cache-dir --force-reinstall --no-deps python-multipart
 
 RUN chmod +x docker/entrypoint.huggingface.sh
 

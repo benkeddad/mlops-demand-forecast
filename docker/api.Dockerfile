@@ -21,7 +21,21 @@ RUN apt-get update \
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    # evidently<0.7.0 (see requirements.txt) unconditionally pulls in
+    # litestar>=2.8.3 (its optional UI server dependency, unused by this
+    # project - only Report/metric classes are imported in
+    # monitoring/drift.py), which in turn unconditionally requires the
+    # `multipart` PyPI package - a completely different, unrelated project
+    # from `python-multipart` that happens to install a same-named
+    # importable `multipart` module. Whichever of the two lands on disk
+    # last silently overwrites the other's files, and if `multipart` wins,
+    # FastAPI refuses to start any route using UploadFile/File with
+    # "Form data requires python-multipart to be installed. It seems you
+    # installed multipart instead." Force `python-multipart` to be the one
+    # left on disk, regardless of resolver install order.
+    && pip uninstall -y multipart \
+    && pip install --no-cache-dir --force-reinstall --no-deps python-multipart
 
 # Copy application files into the image.
 COPY app/ app/

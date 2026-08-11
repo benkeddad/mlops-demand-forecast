@@ -37,7 +37,13 @@ if project_root not in sys.path:
 from src.features import build_features
 from app import state
 from app.auth import require_api_key
-from app.routers import data as data_router, models as models_router, system as system_router, training as training_router
+from app.routers import (
+    data as data_router,
+    models as models_router,
+    query as query_router,
+    system as system_router,
+    training as training_router,
+)
 from app.routers.system import REQUEST_COUNT, REQUEST_LATENCY
 
 # ---------------------------------------------------------------------------
@@ -222,6 +228,7 @@ app.include_router(system_router.router)
 app.include_router(models_router.router)
 app.include_router(data_router.router)
 app.include_router(training_router.router)
+app.include_router(query_router.router)
 
 # ---------------------------------------------------------------------------
 # Routes
