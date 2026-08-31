@@ -49,6 +49,16 @@ scikit-learn>=1.2.0
 xgboost>=1.7.0
 openpyxl>=3.1.0
 pyarrow>=14.0.0  # Added: Much faster than CSV for intermediate DVC stages
+# src/train_optimal.py's hyperparameter search (RFECV + Optuna). Verified
+# against this file's other pins via a dry-run resolve - no conflicts, and
+# sqlalchemy stays on the 2.0.36 pinned above (optuna's own sqlalchemy
+# floor is broad enough not to fight it).
+optuna>=3.5.0
+# src/train_optimal.py's params.yaml parsing. Was already an indirect
+# dependency of several packages above, but not declared directly anywhere
+# a version bump elsewhere could silently drop it - pinned explicitly since
+# this project now imports it directly too.
+pyyaml>=6.0
 
 # --- API Deployment ---
 fastapi>=0.100.0

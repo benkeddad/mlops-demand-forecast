@@ -41,6 +41,7 @@ from app.routers import (
     data as data_router,
     models as models_router,
     query as query_router,
+    reproducibility as reproducibility_router,
     system as system_router,
     training as training_router,
 )
@@ -58,6 +59,11 @@ DB_URL = state.DB_URL
 # at API startup - "<flow name>/<deployment name>" is how run_deployment()
 # addresses it.
 PREFECT_DEPLOYMENT_NAME = "Rossmann-Enterprise-Pipeline/production"
+# The expensive RFECV+Optuna path (pipelines/optimal_training_pipeline.py) -
+# a separate deployment, served by the same pipelines/serve_deployment.py
+# process (see that file), but never fired by the train_changed trigger -
+# only by POST /trigger-optimal-training below.
+OPTIMAL_PREFECT_DEPLOYMENT_NAME = "Rossmann-Optimal-Training-Pipeline/production"
 _deployment_server_process = None
 
 feast_store = FeatureStore(repo_path="feature_repo")
@@ -173,6 +179,17 @@ async def trigger_training_run() -> str:
     asyncio.create_task(wait_and_reload_deployment_run(flow_run.id))
     return str(flow_run.id)
 
+async def trigger_optimal_training_run() -> str:
+    """Same shape as trigger_training_run(), targeting the RFECV+Optuna
+    deployment instead - only ever called from POST /trigger-optimal-training,
+    never from the train_changed trigger. Reuses the same
+    wait_and_reload_deployment_run() poll-then-reload logic: whichever
+    training methodology produced the newly registered model version,
+    reloading it into serving works identically."""
+    flow_run = await run_deployment(name=OPTIMAL_PREFECT_DEPLOYMENT_NAME, timeout=0)
+    asyncio.create_task(wait_and_reload_deployment_run(flow_run.id))
+    return str(flow_run.id)
+
 async def handle_train_db_trigger(connection, pid, channel, payload):
     logger.info("Training trigger received.")
     try:
@@ -229,6 +246,7 @@ app.include_router(models_router.router)
 app.include_router(data_router.router)
 app.include_router(training_router.router)
 app.include_router(query_router.router)
+app.include_router(reproducibility_router.router)
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -259,6 +277,30 @@ async def trigger_training():
     except Exception as e:
         logger.error(f"Manual training trigger failed: {e}")
         raise HTTPException(status_code=503, detail=f"Could not trigger training: {e}")
+
+@app.post(
+    "/trigger-optimal-training",
+    summary="Manually trigger the expensive RFECV+Optuna training run",
+    dependencies=[Depends(require_api_key)],
+)
+async def trigger_optimal_training():
+    """
+    Fires the RFECV feature-selection + Optuna hyperparameter-search
+    training pipeline (src/train_optimal.py via the DVC "train_optimal"
+    stage) - unlike /trigger-training's fast fixed-hyperparameter path,
+    this one is deliberately expensive (RFECV cross-validation plus dozens
+    of Optuna trials) and is never fired automatically by the train_changed
+    trigger, only ever on demand through this endpoint. Registers to the
+    same Rossmann_XGBoost_Model registry as the fast path, so once it
+    completes the usual post-training reload picks up whichever version -
+    fast or optimal - is now the latest.
+    """
+    try:
+        flow_run_id = await trigger_optimal_training_run()
+        return {"status": "Optimal training run triggered.", "flow_run_id": flow_run_id}
+    except Exception as e:
+        logger.error(f"Manual optimal training trigger failed: {e}")
+        raise HTTPException(status_code=503, detail=f"Could not trigger optimal training: {e}")
 
 @app.get("/predict/realtime/{store_id}", summary="Real-time live prediction using Feast + Redis")
 async def predict_realtime(store_id: int):

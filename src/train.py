@@ -1,9 +1,13 @@
+import json
 import os
+import subprocess
 import warnings
+from pathlib import Path
+
 import pandas as pd
 import mlflow
 import mlflow.xgboost
-from data import split_data
+from data import split_data, dataset_fingerprint
 from model import get_model
 from evaluate import calculate_rmspe
 
@@ -55,6 +59,17 @@ mlflow.set_registry_uri(_mlflow_uri)
 
 REGISTERED_MODEL_NAME = "Rossmann_XGBoost_Model"
 
+def _git_commit():
+    """Best-effort commit hash for reproducibility tagging - falls back to
+    "unknown" rather than failing the run if .git isn't present (e.g. some
+    container builds don't COPY it in)."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except Exception:
+        return "unknown"
+
 def run_training(processed_data_s3_path: str):
     print(f"Loading processed features directly from {processed_data_s3_path}...")
     processed_df = pd.read_parquet(processed_data_s3_path, storage_options=get_storage_options())
@@ -74,6 +89,15 @@ def run_training(processed_data_s3_path: str):
         dataset = mlflow.data.from_pandas(processed_df, source=processed_data_s3_path)
         mlflow.log_input(dataset, context="training")
 
+        # Reproducibility provenance: which code and which exact data
+        # produced this run. Consumed by src/reproduce_from_mlflow.py to
+        # check out the same commit and verify the data hasn't drifted.
+        mlflow.set_tag("git_commit", _git_commit())
+        mlflow.log_param("dataset_sha256", dataset_fingerprint(processed_df))
+        # Reflects split_data()'s actual current strategy (a random holdout,
+        # not a time-ordered one) - keep this in sync if that ever changes.
+        mlflow.log_param("validation_strategy", "random_holdout")
+
         model = get_model(n_estimators=150, max_depth=8)
         model.fit(X_train, y_train)
 
@@ -84,6 +108,14 @@ def run_training(processed_data_s3_path: str):
         mlflow.log_param("n_estimators", 150)
         mlflow.log_param("max_depth", 8)
         mlflow.log_metric("val_rmspe", rmspe_score)
+
+        # Also written locally (not just to MLflow) so
+        # pipelines/reproduction_pipeline.py can diff a retrained run's
+        # metrics against the original's without needing a second MLflow
+        # round-trip. Declared as a DVC metrics output below (dvc.yaml).
+        metrics_path = Path("metrics/train_metrics.json")
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_path.write_text(json.dumps({"val_rmspe": rmspe_score}, indent=2), encoding="utf-8")
 
         mlflow.xgboost.log_model(
             xgb_model=model,

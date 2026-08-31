@@ -21,3 +21,21 @@ stages:
     deps:
       - s3://rossmann-mlops-dvc-store/processed-data/train_features.parquet
       - src/train.py
+    metrics:
+      - metrics/train_metrics.json:
+          cache: false
+
+  # Independent of the stages above - never swept into a bare `dvc repro`
+  # (this repo never runs one; every dvc repro call across the codebase
+  # names an explicit stage - see pipelines/training_pipeline.py and
+  # pipelines/optimal_training_pipeline.py). Only ever run via
+  # `dvc repro train_optimal`, triggered by POST /trigger-optimal-training.
+  train_optimal:
+    cmd: python src/train_optimal.py
+    deps:
+      - s3://rossmann-mlops-dvc-store/processed-data/train_features.parquet
+      - src/train_optimal.py
+      - params.yaml
+    metrics:
+      - metrics/train_optimal_metrics.json:
+          cache: false

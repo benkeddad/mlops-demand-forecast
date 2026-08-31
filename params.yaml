@@ -1,0 +1,5 @@
+train_optimal:
+  optuna_n_trials: 40
+  random_state: 42
+  validation_fraction: 0.2
+  min_features_to_select: 8

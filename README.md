@@ -148,16 +148,20 @@ Both deployment scripts publish the same host ports, so only one stack runs at a
 │   ├── data.py               # DVC "ingest" stage — loads train table, writes parquet directly to S3
 │   ├── features.py           # Shared feature transform — used by training, serving, and drift
 │   ├── model.py               # XGBoost model factory
-│   ├── train.py                # DVC "train" stage — fits, evaluates, logs to MLflow
-│   ├── evaluate.py            # RMSPE metric
-│   └── predict_initial.py    # One-shot batch prediction run at container boot
+│   ├── train.py                # DVC "train" stage — fast, fixed-hyperparameter fit, evaluates, logs to MLflow
+│   ├── train_optimal.py       # DVC "train_optimal" stage — RFECV feature selection + Optuna hyperparameter search, on demand only
+│   ├── evaluate.py            # RMSPE metric, plus the fuller regression_metrics() train_optimal.py uses
+│   ├── predict_initial.py    # One-shot batch prediction run at container boot
+│   └── reproduce_from_mlflow.py  # Retrieves a past run's metadata/artifacts, checks current data against its logged hash
 ├── db/
 │   ├── init.sql                # Schema + NOTIFY triggers (the event backbone)
 │   ├── create-databases.sql
 │   └── seed_db.py              # Loads the raw Rossmann CSVs into Postgres — run from the host, before the API ever starts
 ├── pipelines/
 │   ├── training_pipeline.py  # Prefect flow: DVC ingest → featurize → train → push
-│   └── serve_deployment.py    # Registers the Prefect Deployment the API triggers
+│   ├── optimal_training_pipeline.py  # Prefect flow: DVC ingest → featurize → train_optimal → push
+│   ├── serve_deployment.py    # Registers both Prefect Deployments the API triggers
+│   └── reproduction_pipeline.py  # Prefect flow: retrieve → optional dvc repro train → diff metrics → log audit
 ├── monitoring/
 │   └── drift.py                # Evidently drift check, MLflow-logged, CI-schedulable
 ├── feature_repo/
@@ -181,11 +185,12 @@ Both deployment scripts publish the same host ports, so only one stack runs at a
 │   ├── deploy_k3s_reconcile_wsl.bat
 │   ├── install_terraform.sh
 │   └── setup_localstack_and_postgres.sh   # LocalStack buckets + Postgres seeding, run once per deploy before the API starts
-├── tests/                       # 44 unit tests — data, features, model, evaluate, bootstrap, pipeline, auth, state, and router coverage
+├── tests/                       # 73 unit tests — data, features, model, evaluate, bootstrap, pipeline, auth, state, and router coverage
 ├── .github/workflows/
 │   ├── ci.yml                   # flake8 + pytest on push/PR to main
 │   └── drift-monitoring.yml     # Scheduled drift check with an isolated Postgres service container
-├── dvc.yaml                     # ingest → featurize → train pipeline definition (direct s3:// stage outputs)
+├── dvc.yaml                     # ingest → featurize → train / train_optimal pipeline definition (direct s3:// stage outputs)
+├── params.yaml                   # Optuna trial count / RFECV settings for the train_optimal stage
 └── pytest.ini
 ```
 
@@ -332,14 +337,21 @@ If `API_KEY` is unset, control endpoints are open (local/dev mode).
 | `GET` | `/query/run` | Run a read-only SQL query (`SELECT`/`WITH`) against the database |
 | `GET` | `/query/download` | Run a read-only SQL query and download the result as CSV |
 | `POST` | `/trigger-training` | Manually fires the Prefect training deployment |
+| `POST` | `/trigger-optimal-training` | Manually fires the RFECV + Optuna training deployment - expensive, never automatic |
 | `POST` | `/reload-model` | Reloads the latest registered model from MLflow without retraining |
 | `POST` | `/data/upload/train` | Upload a CSV and append it to `train` - control action |
 | `POST` | `/data/upload/test` | Upload a CSV and append it to `test` - control action |
 | `POST` | `/models/{name}/versions/{version}/promote` | Promote a model version alias in MLflow |
 | `POST` | `/models/rollback/{version}` | Roll API serving back to a specific version |
 | `POST` | `/training/runs/{id}/cancel` | Cancel a running Prefect flow run |
+| `POST` | `/reproducibility/{run_id}` | Start a reproducibility audit for a past MLflow run - control action |
+| `GET` | `/reproducibility/jobs/{job_id}` | Check the status/result of a reproducibility audit job |
 
 `/query/*` is intentionally read-only - it rejects anything that isn't a single `SELECT`/`WITH ... SELECT` statement (no `;`-chained statements, no `INSERT`/`UPDATE`/`DELETE`/`DROP`/etc.), and every result is capped at 5,000 rows regardless of what the query itself requests, since `train` alone is 1M+ rows and there's no pagination. Writes only ever happen through `/data/upload/*`, which stay behind `API_KEY` like the other control endpoints - and because both endpoints load via Postgres `COPY`, the same `train_changed`/`test_inserted` triggers described above fire for an uploaded CSV exactly as they would for any other insert, so a bulk upload flows into the same closed loop without any extra wiring.
+
+`/reproducibility/{run_id}` retrieves a past training run's logged metadata and artifacts from MLflow, and checks whether the data currently at `DATA_STORAGE_ROOT` still hashes the same as what produced it (`src/train.py` logs a `dataset_sha256` param and a `git_commit` tag on every run for exactly this check). Pass `execute_retrain=true` to go further and actually re-run `dvc repro train`, diffing the resulting metrics against the original within `tolerance` - the expensive path, so it stays behind `API_KEY` like the other control actions. Runs in the background via `pipelines/reproduction_pipeline.py`, invoked the same way `app/main.py`'s lifespan invokes `pipelines/serve_deployment.py` - a subprocess, not an in-process import - and logs the audit result as its own run in a separate `Rossmann_Reproducibility_Audit` MLflow experiment. Ported from a standalone reproducibility-tooling project ([rossmann-forecasting-automated-model-training](https://github.com/benkeddad/rossmann-forecasting-automated-model-training)) into this project's router/subprocess conventions rather than run as a second FastAPI app on its own port.
+
+`/trigger-optimal-training` fires that same source project's actual training methodology - RFECV feature selection (`TimeSeriesSplit` cross-validated) followed by an Optuna TPE hyperparameter search (`params.yaml` controls trial count and search settings) - ported as `src/train_optimal.py`, a new independent DVC stage (`train_optimal`) alongside the existing `train` stage, not a replacement for it. `src/train.py`'s fast fixed-hyperparameter path is unchanged and still what the `train_changed` Postgres trigger fires automatically on every data change; the RFECV+Optuna path is deliberately never wired to that trigger; given RFECV's cross-validation plus dozens of Optuna trials, running it on every CSV upload would make routine writes to `train` unpredictably slow. It runs only when `/trigger-optimal-training` is called, served by the same `pipelines/serve_deployment.py` process as the fast pipeline's deployment (`prefect.serve()` now serves both concurrently), and registers to the same `Rossmann_XGBoost_Model` registry - the usual post-training reload picks up whichever version, from whichever path, is now latest. Two adaptations from the source project were required, not optional: it assumed a local `data/processed/` parquet file and a live `Date` column to sort by for its time-ordered validation split; this project's data lives on S3 (`get_storage_options()`) and `src/features.py` already breaks `Date` into `Year`/`Month`/`Day` and drops it before `train_optimal.py` ever sees the frame, so `split_data_time_ordered()` (`src/data.py`) reconstructs the sort key from those three columns instead.
 
 ## Testing & CI
 
@@ -347,7 +359,7 @@ If `API_KEY` is unset, control endpoints are open (local/dev mode).
 pytest -v
 ```
 
-57 unit tests across `tests/`, covering data split/ingest, feature engineering and dtype consistency, model/evaluation behavior, DB bootstrapping, Prefect deployment registration, training pipeline stages, API auth/state helpers, and the observability/control routers for models, training, data (incl. CSV upload), and the read-only query console. `pytest.ini` sets `pythonpath = . src pipelines` so both repo-root-style imports (used by `app/main.py`, `monitoring/drift.py`) and script-style imports (used when DVC or Prefect run a module directly) resolve identically under test.
+73 unit tests across `tests/`, covering data split/ingest (random and time-ordered), feature engineering and dtype consistency, model/evaluation behavior, DB bootstrapping, Prefect deployment registration for both training pipelines, training pipeline stages, API auth/state helpers, and the observability/control routers for models, training, data (incl. CSV upload), the read-only query console, and reproducibility auditing. `pytest.ini` sets `pythonpath = . src pipelines` so both repo-root-style imports (used by `app/main.py`, `monitoring/drift.py`) and script-style imports (used when DVC or Prefect run a module directly) resolve identically under test.
 
 - **`ci.yml`** — flake8 (syntax/undefined-name errors only, across `src`, `app`, `pipelines`, and `db`) + the full pytest suite, on every push and PR to `main`.
 - **`drift-monitoring.yml`** — runs daily at 06:00 UTC against a disposable Postgres service container seeded from the same schema and CSVs the real stack uses, so it's a genuine drift check rather than a placeholder. On significant drift it fails the job and, if `RETRAIN_TRIGGER_URL` is set, calls a deployed instance's `/trigger-training` endpoint.
@@ -363,6 +375,11 @@ Documented deliberately rather than discovered by a reviewer:
 - **Single-node K3s** — no HA, no autoscaling. It demonstrates real Kubernetes/Terraform provisioning, not production scale.
 - **The `scripts/*.bat` files are WSL2/Windows-specific by design** (this is the author's environment). The Compose file and Terraform module underneath them are ordinary and portable; only the automation wrapper is not.
 - **Default credentials (`user`/`Password`, `test`/`test` for LocalStack) ship for zero-friction local startup.** Override them via `deploy/.env` (Compose) or `TF_VAR_postgres_password` / `terraform.tfvars` (Terraform) for anything beyond local dev.
+- **Reproducibility runs prior to this integration have no `dataset_sha256`/`git_commit` to check against.** `/reproducibility/{run_id}` still retrieves their metadata and artifacts fine; the dataset-hash verification step just reports `null`/unverifiable for those older runs, not a false pass or failure.
+- **`dvc repro train`'s retrain-and-diff path (`execute_retrain=true`) can legitimately no-op.** If DVC's cache already has an identical-content output for the `train` stage, it skips re-execution rather than re-running - that's still a correct "nothing changed, still reproducible" signal, not a bug, but worth knowing before reading a fast response as "it didn't really retrain."
+- **`/reproducibility/{run_id}`'s `execute_retrain=true` always targets the fast `train` stage, never `train_optimal`.** Auditing a run produced by `/trigger-optimal-training` still retrieves and verifies its metadata/dataset-hash correctly; only the optional re-execute-and-diff step is fast-path-only.
+- **`train_optimal` never runs automatically.** Unlike `train` (fired by the `train_changed` Postgres trigger on every write to `train`), the RFECV+Optuna path only ever runs via `POST /trigger-optimal-training` - deliberately, since a single run can take meaningfully longer than the fast path and doing that on every CSV upload would make routine writes unpredictably slow.
+
 
 ## About the author
 
