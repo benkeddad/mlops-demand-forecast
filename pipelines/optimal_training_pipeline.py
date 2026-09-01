@@ -1,9 +1,11 @@
 """Prefect flow for the expensive RFECV+Optuna training path
 (src/train_optimal.py via the DVC "train_optimal" stage). Mirrors
 pipelines/training_pipeline.py's ingest -> featurize -> train -> push
-structure exactly, swapping only the training stage - ingest/featurize are
-still re-run first (DVC's own cache makes a no-op skip cheap if the
-underlying data hasn't changed, and this guarantees correctness if it has).
+structure, but featurization differs too: src/train_optimal.py trains on
+the rich feature set (build_features_rich(), src/features.py - lag/rolling/
+expanding Sales statistics the fast path's model never sees), produced by
+its own "featurize_rich" DVC stage, not the "featurize" stage
+pipelines/training_pipeline.py runs.
 
 Registered as its own Prefect deployment - see pipelines/serve_deployment.py
 - and triggered on demand via POST /trigger-optimal-training
@@ -23,7 +25,13 @@ warnings.filterwarnings(
 )
 from prefect import flow, task  # noqa: E402
 
-from training_pipeline import _run_dvc, dvc_ingest, dvc_featurize, dvc_push  # noqa: E402
+from training_pipeline import _run_dvc, dvc_ingest, dvc_push  # noqa: E402
+
+
+@task(name="2. DVC: Rich Feature Engineering (train_optimal path)")
+def dvc_featurize_rich():
+    print("Triggering DVC Rich Feature Engineering Stage (RFECV + Optuna path)...")
+    _run_dvc(["dvc", "repro", "featurize_rich"])
 
 
 @task(name="3. DVC: Optimal Model Training (RFECV + Optuna)")
@@ -34,10 +42,12 @@ def dvc_train_optimal():
 
 @flow(name="Rossmann-Optimal-Training-Pipeline")
 def ml_optimal_training_pipeline():
-    # Same three DVC tasks training_pipeline.py reuses (dvc_ingest,
-    # dvc_featurize, dvc_push) - only the training task itself differs.
+    # Reuses dvc_ingest/dvc_push from training_pipeline.py unchanged - only
+    # featurization and training differ, since train_optimal.py trains on
+    # build_features_rich()'s output (featurize_rich), not the lean
+    # train_features.parquet the fast pipeline's dvc_featurize() produces.
     dvc_ingest()
-    dvc_featurize()
+    dvc_featurize_rich()
     dvc_train_optimal()
     dvc_push()
 

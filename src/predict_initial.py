@@ -5,7 +5,7 @@ import mlflow.pyfunc
 from sqlalchemy import create_engine, text
 
 # Import your existing local processing logic
-from features import build_features
+from serving_features import compute_prediction_features, needs_sales_history, HISTORY_LOOKBACK_DAYS
 
 # ============================================================
 # CONFIGURATION & ENVIRONMENT SETUP
@@ -47,8 +47,8 @@ def main():
         print(f"Failed to load model from MLflow: {e}")
         sys.exit(1)
 
-    # 3. MAP COLUMNS AND PROCESS THE TEMPORAL FEATURES LOCALLY
-    # Map lowercase DB column names to what build_features expects
+    # 3. MAP COLUMNS AND PROCESS FEATURES - MATCHING WHATEVER THIS MODEL ACTUALLY NEEDS
+    # Map lowercase DB column names to what build_features/build_features_rich expect
     column_mapping = {
         "store": "Store",
         "dayofweek": "DayOfWeek",
@@ -58,15 +58,31 @@ def main():
         "date": "Date"
     }
     df_renamed = df.rename(columns=column_mapping)
-    
-    print("Processing date and categorical features locally...")
-    # This automatically splits 'Date' into 'Year', 'Month', and 'Day'
-    processed_df = build_features(df_renamed)
 
-    # Enforce strict formatting and feature order to align with XGBoost matrix
-    expected_features = ["Store", "DayOfWeek", "Promo", "StateHoliday", "SchoolHoliday", "Year", "Month", "Day"]
-    features_only = processed_df[expected_features].copy()
-    features_only = features_only.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
+    print("Determining required features from the model's own logged signature...")
+    model_input_columns = model.metadata.get_input_schema().input_names()
+
+    history_df = None
+    if needs_sales_history(model_input_columns):
+        print("Model needs Sales-history features - fetching a bounded historical lookback...")
+        stores = df_renamed["Store"].unique().tolist()
+        earliest_date = df_renamed["Date"].min()
+        history_query = text(
+            """
+            SELECT store, date, sales FROM train
+            WHERE store = ANY(:stores) AND date >= (:earliest_date::date - :lookback_days * INTERVAL '1 day')
+            ORDER BY store, date
+            """
+        )
+        with engine.connect() as conn:
+            history_df = pd.read_sql(
+                history_query, conn,
+                params={"stores": stores, "earliest_date": earliest_date, "lookback_days": HISTORY_LOOKBACK_DAYS},
+            )
+        history_df = history_df.rename(columns={"store": "Store", "date": "Date", "sales": "Sales"})
+        print(f"Fetched {len(history_df)} historical rows across {len(stores)} store(s).")
+
+    features_only = compute_prediction_features(df_renamed, model_input_columns, history_df=history_df)
     
     # 4. RUN BATCH INFERENCE
     print("Running batch inference...")

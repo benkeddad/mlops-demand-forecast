@@ -34,7 +34,7 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 # 2. Now you can import from the 'src' folder directly
-from src.features import build_features
+from src.serving_features import compute_prediction_features, needs_sales_history, HISTORY_LOOKBACK_DAYS
 from app import state
 from app.auth import require_api_key
 from app.routers import (
@@ -79,13 +79,13 @@ async def perform_batch_prediction():
 
     # 1. Connect directly
     connection = await asyncpg.connect(DB_URL)
-    
+
     try:
         # 2. Fetch rows (Now fetching all feature columns instead of just store entity ID)
         rows = await connection.fetch(
             'SELECT id, store, date, dayofweek, promo, stateholiday, schoolholiday FROM test WHERE predicted_sales IS NULL'
         )
-        
+
         if not rows:
             logger.info("No new rows to predict.")
             return
@@ -107,23 +107,35 @@ async def perform_batch_prediction():
         }
         df_renamed = df.rename(columns=column_mapping)
 
-        # 5. Process temporal features locally (Bypassing Feast Online Store temporal limitations)
-        processed_df = build_features(df_renamed)
+        # 5. Ask the currently-loaded model which columns it actually needs,
+        # rather than assuming - a version from src/train.py (the fast path)
+        # and one from src/train_optimal.py (RFECV+Optuna, possibly needing
+        # Sales-history features - see src/serving_features.py) both load
+        # through the exact same code path here.
+        model_input_columns = model.metadata.get_input_schema().input_names()
+        history_df = None
+        if needs_sales_history(model_input_columns):
+            stores = df_renamed["Store"].unique().tolist()
+            earliest_date = df_renamed["Date"].min()
+            history_rows = await connection.fetch(
+                """
+                SELECT store, date, sales FROM train
+                WHERE store = ANY($1::int[]) AND date >= ($2::date - $3 * INTERVAL '1 day')
+                ORDER BY store, date
+                """,
+                stores, earliest_date, HISTORY_LOOKBACK_DAYS,
+            )
+            history_df = pd.DataFrame([dict(r) for r in history_rows]).rename(
+                columns={"store": "Store", "date": "Date", "sales": "Sales"}
+            )
+            logger.info(f"Fetched {len(history_df)} historical rows across {len(stores)} store(s) for Sales-history features.")
 
-        # 6. Strictly enforce column order (The Fix)
-        # Defining the list here ensures the model sees features in the exact same 
-        # order it was trained on.
-        feature_cols = ["Store", "DayOfWeek", "Promo", "StateHoliday", "SchoolHoliday", "Year", "Month", "Day"]
-        
-        # Slice and copy in one single step to prevent DataFrame re-indexing issues
-        features_only = processed_df[feature_cols].copy()
-        
-        # Numeric conversion
-        features_only = features_only.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
-        
+        # 6. Compute exactly the columns the model's signature names, in order.
+        features_only = compute_prediction_features(df_renamed, model_input_columns, history_df=history_df)
+
         # 7. Predict
         predictions = model.predict(features_only)
-        
+
         # 8. Check if predictions are all the same (The Debugger)
         if len(set(predictions)) == 1:
             logger.warning(f"WARNING: Model outputted the same value ({predictions[0]}) for all {len(rows)} rows.")
@@ -131,16 +143,16 @@ async def perform_batch_prediction():
 
         # 9. Update DB
         update_data = [(float(pred), int(row["id"])) for pred, row in zip(predictions, rows)]
-        
+
         await connection.executemany(
-            'UPDATE test SET predicted_sales = $1 WHERE id = $2', 
+            'UPDATE test SET predicted_sales = $1 WHERE id = $2',
             update_data
         )
         logger.info(f"Batch prediction written for {len(rows)} records.")
 
     except Exception as e:
         logger.error(f"Prediction failed: {e}")
-        
+
     finally:
         # Always close to prevent connection leaks
         await connection.close()

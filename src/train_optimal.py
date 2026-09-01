@@ -11,6 +11,17 @@ Registers to the same MLflow registered model (Rossmann_XGBoost_Model) as
 the fast path, so promote/rollback treat a version produced by either path
 identically - only the source experiment and the "training_mode" tag
 distinguish which methodology produced a given version.
+
+Trains on the RICH feature set (build_features_rich(), src/features.py -
+lag/rolling/expanding Sales statistics plus calendar/cyclical features),
+not the lean set src/train.py and serving use. Because a model registered
+here can genuinely need history-dependent features that a bare prediction
+row doesn't carry, app/main.py's perform_batch_prediction() and
+src/predict_initial.py both read the *loaded* model's own MLflow signature
+at prediction time (src/serving_features.py) to decide which feature
+function to run and whether a historical-sales lookback query is needed -
+so promoting an "optimal" version doesn't just work by coincidence, it's
+what the serving path is actually built to handle.
 """
 import json
 import logging
@@ -276,5 +287,7 @@ def run_training_optimal(processed_data_s3_path: str):
 
 
 if __name__ == "__main__":
-    s3_path = f"{DATA_STORAGE_ROOT}/train_features.parquet"
+    # The rich (featurize_rich stage) parquet, not the lean one src/train.py
+    # and serving use - see the docstring above.
+    s3_path = f"{DATA_STORAGE_ROOT}/train_features_rich.parquet"
     run_training_optimal(s3_path)

@@ -142,11 +142,13 @@ Both deployment scripts publish the same host ports, so only one stack runs at a
 ```
 .
 ├── app/
-│   ├── main.py              # FastAPI app: event loop, prediction routes, model hot-swap
+│   ├── main.py              # FastAPI app: event loop, schema-aware prediction routes, model hot-swap
 │   └── db_bootstrap.py      # Idempotently ensures mlflow/prefect/feast/rossmann databases exist
 ├── src/
 │   ├── data.py               # DVC "ingest" stage — loads train table, writes parquet directly to S3
-│   ├── features.py           # Shared feature transform — used by training, serving, and drift
+│   ├── features.py           # build_features() (lean, used by training/serving/drift) + build_features_rich() (train_optimal path)
+│   ├── featurize_rich.py     # DVC "featurize_rich" stage entrypoint - produces train_features_rich.parquet
+│   ├── serving_features.py    # Model-signature-aware prediction features, shared by app/main.py and predict_initial.py
 │   ├── model.py               # XGBoost model factory
 │   ├── train.py                # DVC "train" stage — fast, fixed-hyperparameter fit, evaluates, logs to MLflow
 │   ├── train_optimal.py       # DVC "train_optimal" stage — RFECV feature selection + Optuna hyperparameter search, on demand only
@@ -159,7 +161,7 @@ Both deployment scripts publish the same host ports, so only one stack runs at a
 │   └── seed_db.py              # Loads the raw Rossmann CSVs into Postgres — run from the host, before the API ever starts
 ├── pipelines/
 │   ├── training_pipeline.py  # Prefect flow: DVC ingest → featurize → train → push
-│   ├── optimal_training_pipeline.py  # Prefect flow: DVC ingest → featurize → train_optimal → push
+│   ├── optimal_training_pipeline.py  # Prefect flow: DVC ingest → featurize_rich → train_optimal → push
 │   ├── serve_deployment.py    # Registers both Prefect Deployments the API triggers
 │   └── reproduction_pipeline.py  # Prefect flow: retrieve → optional dvc repro train → diff metrics → log audit
 ├── monitoring/
@@ -185,11 +187,11 @@ Both deployment scripts publish the same host ports, so only one stack runs at a
 │   ├── deploy_k3s_reconcile_wsl.bat
 │   ├── install_terraform.sh
 │   └── setup_localstack_and_postgres.sh   # LocalStack buckets + Postgres seeding, run once per deploy before the API starts
-├── tests/                       # 73 unit tests — data, features, model, evaluate, bootstrap, pipeline, auth, state, and router coverage
+├── tests/                       # 94 unit tests — data, features, model, evaluate, serving, bootstrap, pipeline, auth, state, and router coverage
 ├── .github/workflows/
 │   ├── ci.yml                   # flake8 + pytest on push/PR to main
 │   └── drift-monitoring.yml     # Scheduled drift check with an isolated Postgres service container
-├── dvc.yaml                     # ingest → featurize → train / train_optimal pipeline definition (direct s3:// stage outputs)
+├── dvc.yaml                     # ingest → featurize(_rich) → train / train_optimal pipeline definition (direct s3:// stage outputs)
 ├── params.yaml                   # Optuna trial count / RFECV settings for the train_optimal stage
 └── pytest.ini
 ```
@@ -351,7 +353,13 @@ If `API_KEY` is unset, control endpoints are open (local/dev mode).
 
 `/reproducibility/{run_id}` retrieves a past training run's logged metadata and artifacts from MLflow, and checks whether the data currently at `DATA_STORAGE_ROOT` still hashes the same as what produced it (`src/train.py` logs a `dataset_sha256` param and a `git_commit` tag on every run for exactly this check). Pass `execute_retrain=true` to go further and actually re-run `dvc repro train`, diffing the resulting metrics against the original within `tolerance` - the expensive path, so it stays behind `API_KEY` like the other control actions. Runs in the background via `pipelines/reproduction_pipeline.py`, invoked the same way `app/main.py`'s lifespan invokes `pipelines/serve_deployment.py` - a subprocess, not an in-process import - and logs the audit result as its own run in a separate `Rossmann_Reproducibility_Audit` MLflow experiment. Ported from a standalone reproducibility-tooling project ([rossmann-forecasting-automated-model-training](https://github.com/benkeddad/rossmann-forecasting-automated-model-training)) into this project's router/subprocess conventions rather than run as a second FastAPI app on its own port.
 
-`/trigger-optimal-training` fires that same source project's actual training methodology - RFECV feature selection (`TimeSeriesSplit` cross-validated) followed by an Optuna TPE hyperparameter search (`params.yaml` controls trial count and search settings) - ported as `src/train_optimal.py`, a new independent DVC stage (`train_optimal`) alongside the existing `train` stage, not a replacement for it. `src/train.py`'s fast fixed-hyperparameter path is unchanged and still what the `train_changed` Postgres trigger fires automatically on every data change; the RFECV+Optuna path is deliberately never wired to that trigger; given RFECV's cross-validation plus dozens of Optuna trials, running it on every CSV upload would make routine writes to `train` unpredictably slow. It runs only when `/trigger-optimal-training` is called, served by the same `pipelines/serve_deployment.py` process as the fast pipeline's deployment (`prefect.serve()` now serves both concurrently), and registers to the same `Rossmann_XGBoost_Model` registry - the usual post-training reload picks up whichever version, from whichever path, is now latest. Two adaptations from the source project were required, not optional: it assumed a local `data/processed/` parquet file and a live `Date` column to sort by for its time-ordered validation split; this project's data lives on S3 (`get_storage_options()`) and `src/features.py` already breaks `Date` into `Year`/`Month`/`Day` and drops it before `train_optimal.py` ever sees the frame, so `split_data_time_ordered()` (`src/data.py`) reconstructs the sort key from those three columns instead.
+`/trigger-optimal-training` fires that same source project's actual training methodology - RFECV feature selection (`TimeSeriesSplit` cross-validated) followed by an Optuna TPE hyperparameter search (`params.yaml` controls trial count and search settings) - ported as `src/train_optimal.py`, a new independent DVC stage (`train_optimal`) alongside the existing `train` stage, not a replacement for it. `src/train.py`'s fast fixed-hyperparameter path is unchanged and still what the `train_changed` Postgres trigger fires automatically on every data change; the RFECV+Optuna path is deliberately never wired to that trigger - given RFECV's cross-validation plus dozens of Optuna trials, running it on every CSV upload would make routine writes to `train` unpredictably slow. It runs only when `/trigger-optimal-training` is called, served by the same `pipelines/serve_deployment.py` process as the fast pipeline's deployment (`prefect.serve()` now serves both concurrently), and registers to the same `Rossmann_XGBoost_Model` registry - the usual post-training reload picks up whichever version, from whichever path, is now latest.
+
+It also trains on a genuinely richer feature set than the fast path - `build_features_rich()` (`src/features.py`, its own `featurize_rich` DVC stage) adds calendar/cyclical encodings plus leakage-safe lag, rolling, and expanding statistics on each store's own past Sales (`SalesLag1/7/14/28`, `SalesRollingMean/Std7/14/28`, `SalesMomentum7_28`, `StoreExpandingMeanSales/MedianSales` - all computed via `shift()` before any rolling/expanding window, so a row's own Sales never leaks into its own features). This is not cosmetic: those history-dependent features are typically the single strongest predictors in a sales-forecasting problem, and a model without access to them will score meaningfully worse than one with them, independent of how well its hyperparameters are tuned.
+
+Because a model trained this way can genuinely need a store's recent Sales history to predict from - something a bare `test`-table row doesn't carry - both prediction paths (`app/main.py`'s `perform_batch_prediction()`, the live path the `test_inserted` trigger fires, and `src/predict_initial.py`, the one-shot catch-up run at container boot) read the *currently-loaded* model's own MLflow-logged input signature (`model.metadata.get_input_schema().input_names()`) before predicting, rather than assuming which feature set to compute. `src/serving_features.py` (shared by both call sites, the same "single implementation, two call sites" pattern `build_features()` itself already used) checks whether any of those column names need Sales history; if not, it's the exact lean path as before. If so, it runs a bounded historical query (`store = ANY(...) AND date >= earliest_needed_date - 40 days` - never a full-table scan) and computes the identical `build_features_rich()` transform over (history + new rows) so the new rows' lag/rolling values come out correct - the same mechanism whether serving a fast-path model, an optimal-path one, or an optimal-path model where RFECV happened to select a different subset of the rich columns than last time. Promoting or rolling back to any registered version works uniformly regardless of which training path produced it.
+
+Two adaptations from the source project were required, not optional, to make any of this work against this project's actual architecture: it assumed a local `data/processed/` parquet file and a live `Date` column to sort by for its time-ordered validation split; this project's data lives on S3 (`get_storage_options()`), and `build_features_rich()` deliberately keeps `Date` (unlike the lean `build_features()`, which drops it) both to sort before computing lag/rolling windows and so serving can merge new rows' computed features back out of a combined frame - it's automatically excluded before training reaches RFECV/the model by the same `X.select_dtypes(include=[np.number])` step the source project already had.
 
 ## Testing & CI
 
@@ -359,7 +367,7 @@ If `API_KEY` is unset, control endpoints are open (local/dev mode).
 pytest -v
 ```
 
-73 unit tests across `tests/`, covering data split/ingest (random and time-ordered), feature engineering and dtype consistency, model/evaluation behavior, DB bootstrapping, Prefect deployment registration for both training pipelines, training pipeline stages, API auth/state helpers, and the observability/control routers for models, training, data (incl. CSV upload), the read-only query console, and reproducibility auditing. `pytest.ini` sets `pythonpath = . src pipelines` so both repo-root-style imports (used by `app/main.py`, `monitoring/drift.py`) and script-style imports (used when DVC or Prefect run a module directly) resolve identically under test.
+94 unit tests across `tests/`, covering data split/ingest (random and time-ordered), feature engineering (lean and the rich lag/rolling/expanding set, leakage-safety included) and dtype consistency, model/evaluation behavior, schema-aware serving-feature computation, DB bootstrapping, Prefect deployment registration for both training pipelines, training pipeline stages, API auth/state helpers, and the observability/control routers for models, training, data (incl. CSV upload), the read-only query console, and reproducibility auditing. `pytest.ini` sets `pythonpath = . src pipelines` so both repo-root-style imports (used by `app/main.py`, `monitoring/drift.py`) and script-style imports (used when DVC or Prefect run a module directly) resolve identically under test.
 
 - **`ci.yml`** — flake8 (syntax/undefined-name errors only, across `src`, `app`, `pipelines`, and `db`) + the full pytest suite, on every push and PR to `main`.
 - **`drift-monitoring.yml`** — runs daily at 06:00 UTC against a disposable Postgres service container seeded from the same schema and CSVs the real stack uses, so it's a genuine drift check rather than a placeholder. On significant drift it fails the job and, if `RETRAIN_TRIGGER_URL` is set, calls a deployed instance's `/trigger-training` endpoint.
@@ -379,6 +387,7 @@ Documented deliberately rather than discovered by a reviewer:
 - **`dvc repro train`'s retrain-and-diff path (`execute_retrain=true`) can legitimately no-op.** If DVC's cache already has an identical-content output for the `train` stage, it skips re-execution rather than re-running - that's still a correct "nothing changed, still reproducible" signal, not a bug, but worth knowing before reading a fast response as "it didn't really retrain."
 - **`/reproducibility/{run_id}`'s `execute_retrain=true` always targets the fast `train` stage, never `train_optimal`.** Auditing a run produced by `/trigger-optimal-training` still retrieves and verifies its metadata/dataset-hash correctly; only the optional re-execute-and-diff step is fast-path-only.
 - **`train_optimal` never runs automatically.** Unlike `train` (fired by the `train_changed` Postgres trigger on every write to `train`), the RFECV+Optuna path only ever runs via `POST /trigger-optimal-training` - deliberately, since a single run can take meaningfully longer than the fast path and doing that on every CSV upload would make routine writes unpredictably slow.
+- **Predicting with a rich-feature (RFECV+Optuna) model costs one extra bounded query per batch.** `perform_batch_prediction()`/`predict_initial.py` only run the historical-Sales lookback (`src/serving_features.py`) when the currently-loaded model's own signature actually needs it - a fast-path model never triggers it, and the query itself is always bounded to the stores in the current batch and a 40-day window, never a full-table scan. Still strictly more work than the lean path's zero extra queries, worth knowing if `test` inserts and prediction latency matter under load.
 
 
 ## About the author

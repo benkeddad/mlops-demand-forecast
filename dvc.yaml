@@ -16,6 +16,20 @@ stages:
       - s3://rossmann-mlops-dvc-store/processed-data/train_features.parquet:
           cache: false
 
+  # Independent from `featurize` above - src/train.py and serving
+  # (app/main.py, src/predict_initial.py) never read this output, only
+  # src/train_optimal.py does. Same clean_data.parquet input, different
+  # feature function (build_features_rich() vs build_features()).
+  featurize_rich:
+    cmd: python src/featurize_rich.py
+    deps:
+      - s3://rossmann-mlops-dvc-store/processed-data/clean_data.parquet
+      - src/features.py
+      - src/featurize_rich.py
+    outs:
+      - s3://rossmann-mlops-dvc-store/processed-data/train_features_rich.parquet:
+          cache: false
+
   train:
     cmd: python src/train.py
     deps:
@@ -33,7 +47,7 @@ stages:
   train_optimal:
     cmd: python src/train_optimal.py
     deps:
-      - s3://rossmann-mlops-dvc-store/processed-data/train_features.parquet
+      - s3://rossmann-mlops-dvc-store/processed-data/train_features_rich.parquet
       - src/train_optimal.py
       - params.yaml
     metrics:
