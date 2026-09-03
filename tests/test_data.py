@@ -67,6 +67,7 @@ def test_split_data_time_ordered_holds_out_the_latest_rows():
 def test_split_data_time_ordered_drops_target_and_feast_identifier_columns():
     df = pd.DataFrame({
         "Store": range(20),
+        "Date": pd.date_range("2015-01-01", periods=20),
         "Year": [2015] * 20,
         "Month": [1] * 20,
         "Day": list(range(1, 21)),
@@ -79,6 +80,12 @@ def test_split_data_time_ordered_drops_target_and_feast_identifier_columns():
         assert "Sales" not in X.columns
         assert "entity_id" not in X.columns
         assert "event_timestamp" not in X.columns
+        # build_features_rich() keeps Date (needed to sort and, at serving
+        # time, to merge results back - see src/features.py) - it must still
+        # never reach RFECV/the model as a raw feature, matching the source
+        # project's own explicit drop rather than relying only on the
+        # downstream X.select_dtypes(include=[np.number]) filter to catch it.
+        assert "Date" not in X.columns
     assert len(X_train) + len(X_val) == 20
 
 

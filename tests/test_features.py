@@ -1,7 +1,13 @@
 import pandas as pd
 import pytest
 
-from src.features import FEATURE_COLUMNS, RICH_HISTORY_DEPENDENT_PREFIXES, build_features, build_features_rich
+from src.features import (
+    FEATURE_COLUMNS,
+    RICH_HISTORY_DEPENDENT_PREFIXES,
+    build_features,
+    build_features_rich,
+    compute_rich_feature_diagnostics,
+)
 
 
 def test_build_features_splits_date_into_year_month_day():
@@ -169,3 +175,38 @@ def test_rich_history_dependent_prefixes_matches_actual_generated_columns():
     history_cols = [c for c in result.columns if c.startswith(("SalesLag", "SalesRolling", "SalesMomentum", "StoreExpanding"))]
     assert history_cols  # sanity: there are some
     assert all(col.startswith(RICH_HISTORY_DEPENDENT_PREFIXES) for col in history_cols)
+
+
+# --- compute_rich_feature_diagnostics() (src/featurize_rich.py, src/train_optimal.py) ---
+
+def test_compute_rich_feature_diagnostics_reports_full_history_as_low_cold_start():
+    # 50 days per store, well beyond the 28-day lag window - only the first
+    # 28 rows per store are structurally "cold start".
+    dates = pd.date_range("2015-01-01", periods=50, freq="D")
+    df = pd.concat([
+        pd.DataFrame({"Store": s, "Date": dates, "Sales": range(50)}) for s in (1, 2)
+    ], ignore_index=True)
+    diag = compute_rich_feature_diagnostics(df)
+    assert diag["total_rows"] == 100
+    assert diag["n_stores"] == 2
+    assert diag["cold_start_rows_lag28"] == 56  # 28 per store x 2 stores
+    assert diag["cold_start_fraction_lag28"] == pytest.approx(0.56)
+    assert diag["rows_per_store_min"] == 50
+    assert diag["rows_per_store_max"] == 50
+    assert diag["date_span_days"] == 49
+
+
+def test_compute_rich_feature_diagnostics_flags_short_history_with_high_cold_start_fraction():
+    # Only 10 days total - every row is within the first 28 for its store,
+    # so 100% cold start. This is the exact shape that should trigger
+    # featurize_rich.py's warning and train_optimal.py's logged warning.
+    dates = pd.date_range("2015-01-01", periods=10, freq="D")
+    df = pd.DataFrame({"Store": 1, "Date": dates, "Sales": range(10)})
+    diag = compute_rich_feature_diagnostics(df)
+    assert diag["cold_start_fraction_lag28"] == 1.0
+    assert diag["cold_start_rows_lag28"] == 10
+
+
+def test_compute_rich_feature_diagnostics_handles_empty_and_missing_store():
+    assert compute_rich_feature_diagnostics(pd.DataFrame()) == {}
+    assert compute_rich_feature_diagnostics(pd.DataFrame({"Sales": [1, 2, 3]})) == {}

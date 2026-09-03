@@ -90,6 +90,38 @@ def _safe_divide(a, b):
     return np.where(np.asarray(b) == 0, 0, np.asarray(a) / np.asarray(b))
 
 
+def compute_rich_feature_diagnostics(df: pd.DataFrame) -> dict:
+    """Data-sufficiency summary for build_features_rich()'s output - how
+    much continuous per-store history is actually present, and what
+    fraction of rows are "cold start" for the longest (28-day) lag/rolling
+    window and therefore get the fillna(0) default rather than a real
+    value. Used by src/featurize_rich.py (writes it + warns) and
+    src/train_optimal.py (logs it onto the MLflow run) so a training run
+    that scored worse than expected is diagnosable from data volume alone,
+    without needing to already suspect that as the cause.
+    """
+    if "Store" not in df.columns:
+        return {}
+    row_position_in_store = df.groupby("Store").cumcount()
+    cold_start_28 = int((row_position_in_store < 28).sum())
+    rows_per_store = df.groupby("Store").size()
+    date_span_days = (
+        int((df["Date"].max() - df["Date"].min()).days)
+        if "Date" in df.columns and df["Date"].notna().any()
+        else None
+    )
+    return {
+        "total_rows": int(len(df)),
+        "n_stores": int(df["Store"].nunique()),
+        "date_span_days": date_span_days,
+        "rows_per_store_min": int(rows_per_store.min()) if len(rows_per_store) else None,
+        "rows_per_store_median": float(rows_per_store.median()) if len(rows_per_store) else None,
+        "rows_per_store_max": int(rows_per_store.max()) if len(rows_per_store) else None,
+        "cold_start_rows_lag28": cold_start_28,
+        "cold_start_fraction_lag28": round(cold_start_28 / len(df), 4) if len(df) else 0.0,
+    }
+
+
 def build_features_rich(df: pd.DataFrame) -> pd.DataFrame:
     """Full feature set for src/train_optimal.py's RFECV+Optuna path -
     everything build_features() has, plus calendar/cyclical features and

@@ -54,7 +54,7 @@ def split_data_time_ordered(df: pd.DataFrame, target_col: str, validation_fracti
     train_df = work.iloc[:-n_val].copy()
     val_df = work.iloc[-n_val:].copy()
 
-    drop_cols = [c for c in (target_col, "entity_id", "event_timestamp") if c in df.columns]
+    drop_cols = [c for c in (target_col, "entity_id", "event_timestamp", "Date") if c in df.columns]
     X_train = train_df.drop(columns=drop_cols, errors="ignore")
     X_val = val_df.drop(columns=drop_cols, errors="ignore")
     y_train = train_df[target_col]

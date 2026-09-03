@@ -42,6 +42,7 @@ from sklearn.model_selection import TimeSeriesSplit
 
 from data import dataset_fingerprint, split_data_time_ordered
 from evaluate import regression_metrics
+from features import RICH_HISTORY_DEPENDENT_PREFIXES, compute_rich_feature_diagnostics
 from model import get_model
 
 # Same two warnings, same reasoning, as src/train.py - this script also
@@ -191,6 +192,37 @@ def _log_trial_progress(study, trial):
 def run_training_optimal(processed_data_s3_path: str):
     logger.info("Loading processed features from %s", processed_data_s3_path)
     processed_df = pd.read_parquet(processed_data_s3_path, storage_options=get_storage_options())
+
+    # Loud failure instead of a silent, quietly-degraded run: if this data
+    # doesn't actually have any history-dependent columns, something is
+    # wrong upstream (e.g. featurize_rich didn't run, or this path somehow
+    # got pointed at the lean train_features.parquet instead) - better to
+    # stop here than to train "successfully" on what's effectively the lean
+    # feature set while believing it's the rich one.
+    history_cols_present = [c for c in processed_df.columns if c.startswith(RICH_HISTORY_DEPENDENT_PREFIXES)]
+    if not history_cols_present:
+        raise ValueError(
+            f"'{processed_data_s3_path}' has none of the expected history-dependent "
+            f"columns ({RICH_HISTORY_DEPENDENT_PREFIXES}). This should be the featurize_rich "
+            "stage's output (build_features_rich()) - check that the featurize_rich DVC stage "
+            "actually ran and succeeded before this one, and that DATA_STORAGE_ROOT points at "
+            f"the same S3 bucket/prefix that wrote it. Columns found: {sorted(processed_df.columns.tolist())}"
+        )
+
+    # Data-sufficiency diagnostics - computed directly from this run's own
+    # data (not read from a file featurize_rich.py may or may not have
+    # written in this working directory), so it's always accurate for what
+    # this specific run actually trained on.
+    diagnostics = compute_rich_feature_diagnostics(processed_df)
+    cold_start_fraction = diagnostics.get("cold_start_fraction_lag28")
+    if cold_start_fraction is not None and cold_start_fraction > 0.10:
+        logger.warning(
+            "%.1f%% of training rows are 'cold start' for 28-day lag/rolling features "
+            "(fillna(0) default, not a real historical value) - this limits how much the "
+            "history-dependent features can help regardless of model/search quality.",
+            cold_start_fraction * 100,
+        )
+
     X_train, X_val, y_train, y_val = split_data_time_ordered(
         processed_df, target_col="Sales", validation_fraction=VALIDATION_FRACTION
     )
@@ -218,6 +250,11 @@ def run_training_optimal(processed_data_s3_path: str):
         # time-ordered - see split_data_time_ordered() in src/data.py.
         mlflow.log_param("validation_strategy", "time_ordered_holdout")
         mlflow.log_param("optuna_n_trials", N_TRIALS)
+        mlflow.log_param("n_history_dependent_columns_available", len(history_cols_present))
+        if diagnostics:
+            mlflow.log_params({f"data_{k}": v for k, v in diagnostics.items() if k != "cold_start_fraction_lag28"})
+            if cold_start_fraction is not None:
+                mlflow.log_metric("cold_start_fraction_lag28", cold_start_fraction)
 
         selected_features, ranking = _select_features_rfe(X_train, y_train, min_features=MIN_FEATURES_TO_SELECT)
         Path("models").mkdir(exist_ok=True)
@@ -226,6 +263,16 @@ def run_training_optimal(processed_data_s3_path: str):
         mlflow.log_artifact("models/selected_features.json", artifact_path="feature_selection")
         mlflow.log_artifact("models/feature_selection_report.json", artifact_path="feature_selection")
         mlflow.log_param("n_selected_features", len(selected_features))
+        n_history_selected = sum(1 for f in selected_features if f.startswith(RICH_HISTORY_DEPENDENT_PREFIXES))
+        mlflow.log_param("n_history_dependent_features_selected", n_history_selected)
+        if n_history_selected == 0:
+            logger.warning(
+                "RFECV selected zero history-dependent features out of %s candidates - "
+                "the model trained from this run will behave like a lean-feature model "
+                "regardless of the rich data it was given. Check feature_selection_report.json "
+                "for what ranked below the %s selected features.",
+                len(history_cols_present), len(selected_features),
+            )
 
         X_train_sel = X_train[selected_features]
         X_val_sel = X_val[selected_features]
